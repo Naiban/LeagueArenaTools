@@ -77,3 +77,7 @@ It does not download or execute programs.
 LeagueArenaTools is an independent, unofficial project. It is not endorsed by
 Riot Games. League of Legends and Riot Games are trademarks or registered
 trademarks of Riot Games, Inc.
+
+## License
+
+LeagueArenaTools is released under the [MIT License](LICENSE).
