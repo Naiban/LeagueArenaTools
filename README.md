@@ -1,5 +1,9 @@
 # LeagueArenaTools
 
+<p align="center">
+  <img src="league_arena_tools.png" alt="LeagueArenaTools logo" width="128">
+</p>
+
 LeagueArenaTools is a Windows desktop utility for automating common League of
 Legends client actions through the local League Client API (LCU).
 
@@ -58,9 +62,6 @@ Settings are stored next to the source file or executable in
 `league_arena_tools_config.json`. The file supports multiple named profiles and
 is excluded from Git because it contains personal preferences and notification
 topics.
-
-Existing `shinkansen_config.json` settings are imported automatically when the
-new configuration file does not exist.
 
 ## Network access
 

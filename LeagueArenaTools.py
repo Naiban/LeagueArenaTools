@@ -51,7 +51,6 @@ def get_resource_path(filename):
 
 
 CONFIG_PATH = os.path.join(get_base_dir(), "league_arena_tools_config.json")
-LEGACY_CONFIG_PATH = os.path.join(get_base_dir(), "shinkansen_config.json")
 PROFILE_STORE_VERSION = 1
 
 MIN_DELAY_MS = 1
@@ -110,15 +109,12 @@ def _merge_config(saved=None):
 
 def load_profile_store():
     raw = None
-    for path in (CONFIG_PATH, LEGACY_CONFIG_PATH):
-        if not os.path.exists(path):
-            continue
+    if os.path.exists(CONFIG_PATH):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-            break
         except Exception:
-            continue
+            pass
 
     profiles = {}
     active_profile = "Default"
