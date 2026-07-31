@@ -1,43 +1,31 @@
-# LeagueArenaTools
+# LeagueArenaTools LCU
 
 <p align="center">
   <img src="league_arena_tools.png" alt="LeagueArenaTools logo" width="128">
 </p>
 
-LeagueArenaTools is a Windows desktop utility for automating common League of
+LeagueArenaTools is a tool that connects to League of
 Legends client actions through the local League Client API (LCU).
 
+<img width="1076" height="757" alt="obraz" src="https://github.com/user-attachments/assets/f4be21c3-c540-4223-ac55-7135ee914a39" />
+<img width="1077" height="751" alt="obraz" src="https://github.com/user-attachments/assets/c5ed3176-30c2-45b3-95d4-4a48a03a8ff5" />
+## Warning
+- App is fully optimized for Arena Gamemode and not tested in other gamemodes
 ## Features
 
-- Automatic ready-check acceptance with configurable timing
-- Ordered champion ban and pick priorities
-- Normal and instant champion selection
-- Arena Bravery selection using `championId=-3`
-- Automatic champion hover
-- Automatic matchmaking restart after joining a lobby
-- Champ-select chat messages
-- Custom League status editor without an application-side character limit
-- Multiple named configuration profiles
-- Optional ntfy phone notifications
-- Notification-area operation
-- Automatic update checks with SHA-256-verified installation
-
-Profile creation, activation, and deletion are disabled while the bot is
-running. Stop the bot before switching configurations.
+- 👦🏾Auto Accept 
+- 👩🏿‍🦯Instant Hover&Pick&Ban (Bravery Pick Option)
+- 🛀🏿Automatic champion hover
+- 👍Auto Re-Queue
+- 👨‍✈️Champ-Select Message
+- 🦹‍♂️League Status Editor
+- 💬lobby Message
+- 👩‍🦽Ntfy phone notifications
 
 ## Download
 
 Download `LeagueArenaTools.exe` from the
 [latest GitHub release](https://github.com/Naiban/LeagueArenaTools/releases/latest).
-The executable is currently unsigned, so Windows SmartScreen or antivirus
-software may show a warning until the project establishes reputation or the
-binary is digitally signed.
-
-Automatic update checks use the public GitHub Releases API and do not contain
-or request a GitHub access token. They therefore become available when this
-repository is public. While it is private, the application reports that the
-update service is unavailable. Automatic installation is supported by the
-packaged EXE; source runs can check releases but do not replace source files.
 
 ## Run from source
 
@@ -66,28 +54,21 @@ The executable is written to `dist/LeagueArenaTools.exe`.
 ## Configuration
 
 Settings are stored next to the source file or executable in
-`league_arena_tools_config.json`. The file supports multiple named profiles and
-is excluded from Git because it contains personal preferences and notification
-topics.
+`league_arena_tools_config.json`. The file supports multiple configs.
 
 ## Network access
 
 LeagueArenaTools communicates with:
 
-- the local League Client API on `127.0.0.1`;
-- the local Live Client API on `127.0.0.1`;
+- via official lcu api client;
 - `ntfy.sh` only when phone notifications are enabled.
 - `api.github.com` and GitHub release download hosts for update checks and
   SHA-256-verified updates.
 
-It only downloads executable updates after confirmation, and installs them
-when their size and GitHub-provided SHA-256 digest match the release metadata.
+## ⚠️Disclaimer
 
-## Disclaimer
-
-LeagueArenaTools is an independent, unofficial project. It is not endorsed by
-Riot Games. League of Legends and Riot Games are trademarks or registered
-trademarks of Riot Games, Inc.
+LeagueArenaTools is Third-Party Tool. It is not endorsed by
+Riot Games, use at your own risk
 
 ## License
 
