@@ -7,8 +7,11 @@ import time
 import random
 import base64
 import secrets
+import hashlib
+import subprocess
 import threading
 from datetime import datetime
+from urllib.parse import unquote, urlparse
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext, simpledialog, messagebox
@@ -28,11 +31,115 @@ try:
 except ImportError:
     websocket = None
 
-__version__ = "1.00"
+__version__ = "1.01"
 APP_TITLE = "LeagueArenaTools"
 WEBSOCKET_RECONNECT_DELAY = 0.25
 BRAVERY_LABEL = "Bravery"
 BRAVERY_KEY = "__BRAVERY__"
+GITHUB_OWNER = "Naiban"
+GITHUB_REPO = "LeagueArenaTools"
+GITHUB_LATEST_RELEASE_API = (
+    f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+)
+UPDATE_ASSET_NAME = "LeagueArenaTools.exe"
+MAX_UPDATE_SIZE = 250 * 1024 * 1024
+
+
+class UpdateError(Exception):
+    """Raised when release metadata or an update download is unsafe."""
+
+
+def _version_tuple(value):
+    match = re.fullmatch(r"v?([0-9]+(?:\.[0-9]+)*)", str(value).strip(), re.IGNORECASE)
+    if not match:
+        raise UpdateError(f"Invalid release version: {value!r}")
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def _is_newer_version(candidate, current):
+    candidate_parts = _version_tuple(candidate)
+    current_parts = _version_tuple(current)
+    width = max(len(candidate_parts), len(current_parts))
+    return candidate_parts + (0,) * (width - len(candidate_parts)) > (
+        current_parts + (0,) * (width - len(current_parts))
+    )
+
+
+def _validate_release_asset_url(url):
+    parsed = urlparse(str(url))
+    expected_prefix = f"/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/"
+    path = unquote(parsed.path)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "github.com"
+        or not path.startswith(expected_prefix)
+        or path.rsplit("/", 1)[-1] != UPDATE_ASSET_NAME
+    ):
+        raise UpdateError("The release asset URL is not an expected GitHub download.")
+    return url
+
+
+def _release_update(release, current_version=__version__):
+    if not isinstance(release, dict) or release.get("draft") or release.get("prerelease"):
+        raise UpdateError("GitHub did not return a stable published release.")
+    tag = str(release.get("tag_name") or "").strip()
+    if not _is_newer_version(tag, current_version):
+        return None
+    assets = [
+        asset for asset in release.get("assets", [])
+        if isinstance(asset, dict) and asset.get("name") == UPDATE_ASSET_NAME
+    ]
+    if len(assets) != 1:
+        raise UpdateError(f"Release {tag} must contain exactly one {UPDATE_ASSET_NAME} asset.")
+    asset = assets[0]
+    digest = str(asset.get("digest") or "")
+    if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
+        raise UpdateError("The release asset has no valid SHA-256 digest.")
+    size = asset.get("size")
+    if not isinstance(size, int) or size <= 0 or size > MAX_UPDATE_SIZE:
+        raise UpdateError("The release asset size is invalid or exceeds the safety limit.")
+    url = _validate_release_asset_url(asset.get("browser_download_url"))
+    return {
+        "version": tag.lstrip("vV"),
+        "tag": tag,
+        "url": url,
+        "digest": digest.split(":", 1)[1].lower(),
+        "size": size,
+    }
+
+
+def _download_update(update, destination, session=requests):
+    hasher = hashlib.sha256()
+    downloaded = 0
+    try:
+        with open(destination, "wb") as output:
+            with session.get(
+                update["url"], stream=True, timeout=(10, 60), allow_redirects=True,
+                headers={"Accept": "application/octet-stream", "User-Agent": APP_TITLE},
+            ) as response:
+                response.raise_for_status()
+                final_host = (urlparse(response.url).hostname or "").lower()
+                if final_host != "github.com" and not final_host.endswith(".githubusercontent.com"):
+                    raise UpdateError("GitHub redirected the update to an unexpected host.")
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    downloaded += len(chunk)
+                    if downloaded > MAX_UPDATE_SIZE or downloaded > update["size"]:
+                        raise UpdateError("The update download exceeded its declared size.")
+                    hasher.update(chunk)
+                    output.write(chunk)
+        if downloaded != update["size"]:
+            raise UpdateError("The update download is incomplete.")
+        if hasher.hexdigest().lower() != update["digest"]:
+            raise UpdateError("The downloaded update failed SHA-256 verification.")
+        return destination
+    except Exception:
+        try:
+            os.remove(destination)
+        except OSError:
+            pass
+        raise
 
 
 # =============================================================================
@@ -83,6 +190,7 @@ DEFAULT_CONFIG = {
     "custom_status_text": "",
     "auto_requeue_enabled": False,
     "minimize_to_tray": True,
+    "auto_update_enabled": True,
 }
 
 
@@ -2266,6 +2374,10 @@ class App:
         self._active_page = None
         self._status_request_running = False
         self._loading_profile = False
+        self._update_check_after_id = None
+        self._update_check_running = False
+        self._update_installing = False
+        self._available_update = None
 
         root.title(f"{APP_TITLE} v{__version__}")
         root.geometry(f"{WIN_W}x{WIN_H}")
@@ -2287,6 +2399,8 @@ class App:
         self._show_page("dashboard")
         self.log(f"{APP_TITLE} v{__version__} started. Profile: {self.active_profile}")
         self._poll_connection()
+        if self.var_auto_update.get():
+            self._update_check_after_id = self.root.after(2500, self._check_for_updates)
 
     def _init_variables(self):
         cfg = self.live_config
@@ -2309,6 +2423,7 @@ class App:
         self.active_profile_var = tk.StringVar(value=f"Active: {self.active_profile}")
         self.profile_notice_var = tk.StringVar(value="")
         self.var_minimize_to_tray = tk.BooleanVar(value=cfg.get("minimize_to_tray", True))
+        self.var_auto_update = tk.BooleanVar(value=cfg.get("auto_update_enabled", True))
         self.var_delay_ms = tk.IntVar(value=int(cfg.get("delay_ms", 500)))
 
         bindings = (
@@ -2326,6 +2441,7 @@ class App:
             ("lobby_message_enabled", self.var_lobby_message_enabled, self._bind_bool),
             ("lobby_message_text", self.var_lobby_message_text, self._bind_str),
             ("minimize_to_tray", self.var_minimize_to_tray, self._bind_bool),
+            ("auto_update_enabled", self.var_auto_update, self._bind_bool),
             ("delay_ms", self.var_delay_ms, self._bind_int),
         )
         for key, variable, binder in bindings:
@@ -2339,6 +2455,7 @@ class App:
         self.status_var = tk.StringVar(value="Looking for League client...")
         self.bot_state_var = tk.StringVar(value="Stopped")
         self.champion_count_var = tk.StringVar(value="Not loaded")
+        self.update_status_var = tk.StringVar(value="Update check pending")
 
     def _build_header(self):
         header = tk.Frame(self.root, bg=SIDEBAR_BG, height=76, highlightthickness=1,
@@ -2556,6 +2673,26 @@ class App:
         )
         tk.Label(background_card.body, text=note, bg=PANEL_BG, fg=TEXT_MUTED,
                  justify="left", anchor="w", font=("Segoe UI", 9)).pack(fill="x")
+
+        update_card = Card(
+            page, "Updates", toggle_var=self.var_auto_update,
+            on_toggle=self._on_auto_update_toggle,
+        )
+        update_card.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        update_row = tk.Frame(update_card.body, bg=PANEL_BG)
+        update_row.pack(fill="x")
+        tk.Label(update_row, textvariable=self.update_status_var, bg=PANEL_BG,
+                 fg=TEXT_MUTED, justify="left", anchor="w", wraplength=490,
+                 font=("Segoe UI", 9)).pack(side="left", fill="x", expand=True)
+        self.update_install_button = MiniButton(
+            update_row, "Install", command=self._install_available_update,
+            width=9, state="disabled",
+        )
+        self.update_install_button.pack(side="right", padx=(8, 0))
+        self.update_check_button = MiniButton(
+            update_row, "Check now", command=lambda: self._check_for_updates(manual=True), width=10,
+        )
+        self.update_check_button.pack(side="right", padx=(8, 0))
 
     def _build_notifications(self, page):
         card = Card(page, "Phone Notifications", toggle_var=self.var_push_enabled)
@@ -2809,6 +2946,7 @@ class App:
             (self.var_lobby_message_enabled, bool(cfg.get("lobby_message_enabled", False))),
             (self.var_lobby_message_text, cfg.get("lobby_message_text") or ""),
             (self.var_minimize_to_tray, bool(cfg.get("minimize_to_tray", True))),
+            (self.var_auto_update, bool(cfg.get("auto_update_enabled", True))),
             (self.var_delay_ms, int(cfg.get("delay_ms", 500))),
         )
         for variable, value in values:
@@ -2899,6 +3037,162 @@ class App:
             self._schedule_save()
         variable.trace_add("write", callback)
         self.live_config[key] = variable.get()
+
+    def _on_auto_update_toggle(self):
+        if self.var_auto_update.get() and not self._available_update:
+            self._check_for_updates(manual=True)
+
+    def _check_for_updates(self, manual=False):
+        if self._closing or self._update_check_running or self._update_installing:
+            return
+        self._update_check_running = True
+        self.update_status_var.set("Checking GitHub Releases...")
+        self.update_check_button.configure(state="disabled", cursor="arrow")
+
+        def worker():
+            try:
+                response = requests.get(
+                    GITHUB_LATEST_RELEASE_API,
+                    timeout=(5, 15),
+                    headers={
+                        "Accept": "application/vnd.github+json",
+                        "User-Agent": APP_TITLE,
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                )
+                if response.status_code == 404:
+                    raise UpdateError(
+                        "Update service unavailable while the GitHub repository is private."
+                    )
+                response.raise_for_status()
+                update = _release_update(response.json())
+                self.root.after(0, lambda: self._finish_update_check(update, None, manual))
+            except UpdateError as exc:
+                self.root.after(0, lambda error=str(exc): self._finish_update_check(None, error, manual))
+            except (requests.RequestException, ValueError):
+                self.root.after(
+                    0, lambda: self._finish_update_check(
+                        None, "Could not reach GitHub Releases.", manual
+                    )
+                )
+
+        threading.Thread(target=worker, name="LeagueArenaTools-UpdateCheck", daemon=True).start()
+
+    def _finish_update_check(self, update, error, manual):
+        if self._closing:
+            return
+        self._update_check_running = False
+        self.update_check_button.configure(state="normal", cursor="hand2")
+        if error:
+            self.update_status_var.set(error)
+            if manual:
+                self.log(f"Update check: {error}")
+            return
+        self._available_update = update
+        if update:
+            self.update_status_var.set(f"Version {update['version']} is available.")
+            self.update_install_button.configure(state="normal", cursor="hand2")
+            self.log(f"LeagueArenaTools v{update['version']} is available.")
+        else:
+            self.update_status_var.set(f"LeagueArenaTools v{__version__} is up to date.")
+            self.update_install_button.configure(state="disabled", cursor="arrow")
+            if manual:
+                self.log("No newer LeagueArenaTools release is available.")
+
+    def _install_available_update(self):
+        update = self._available_update
+        if not update or self._update_installing:
+            return
+        if not getattr(sys, "frozen", False):
+            message = "Automatic installation is available only in LeagueArenaTools.exe."
+            self.update_status_var.set(message)
+            self.log(message)
+            return
+        if not messagebox.askyesno(
+            "Install update",
+            f"Download and install LeagueArenaTools v{update['version']} now?\n\n"
+            "The application will close and restart automatically.",
+            parent=self.root,
+        ):
+            return
+        self._update_installing = True
+        self.update_status_var.set(f"Downloading version {update['version']}...")
+        self.update_check_button.configure(state="disabled", cursor="arrow")
+        self.update_install_button.configure(state="disabled", cursor="arrow")
+        destination = os.path.join(
+            os.path.dirname(sys.executable), f".{APP_TITLE}-update-{os.getpid()}.exe"
+        )
+        try:
+            os.remove(destination)
+        except OSError:
+            pass
+
+        def worker():
+            try:
+                _download_update(update, destination)
+                self.root.after(0, lambda: self._apply_downloaded_update(destination, update))
+            except (UpdateError, requests.RequestException, OSError) as exc:
+                self.root.after(0, lambda error=str(exc): self._update_install_failed(error))
+
+        threading.Thread(target=worker, name="LeagueArenaTools-UpdateDownload", daemon=True).start()
+
+    def _update_install_failed(self, error):
+        if self._closing:
+            return
+        self._update_installing = False
+        message = error or "The update could not be downloaded."
+        self.update_status_var.set(message)
+        self.update_check_button.configure(state="normal", cursor="hand2")
+        self.update_install_button.configure(state="normal", cursor="hand2")
+        self.log(f"Update installation failed: {message}")
+
+    def _apply_downloaded_update(self, downloaded_path, update):
+        if self._closing:
+            return
+        executable = os.path.abspath(sys.executable)
+        script_path = os.path.join(
+            os.path.dirname(executable), f".{APP_TITLE}-update-{os.getpid()}.cmd"
+        )
+        batch_executable = executable.replace("%", "%%")
+        batch_download = os.path.abspath(downloaded_path).replace("%", "%%")
+        script = (
+            "@echo off\r\n"
+            "setlocal\r\n"
+            ":wait\r\n"
+            f'tasklist /FI "PID eq {os.getpid()}" /NH 2>NUL | find "{os.getpid()}" >NUL\r\n'
+            "if not errorlevel 1 (timeout /T 1 /NOBREAK >NUL & goto wait)\r\n"
+            "set attempts=0\r\n"
+            ":replace\r\n"
+            f'move /Y "{batch_download}" "{batch_executable}" >NUL 2>&1\r\n'
+            "if not errorlevel 1 goto restart\r\n"
+            "set /A attempts+=1\r\n"
+            "if %attempts% GEQ 20 goto cleanup\r\n"
+            "timeout /T 1 /NOBREAK >NUL\r\n"
+            "goto replace\r\n"
+            ":restart\r\n"
+            f'start "" "{batch_executable}"\r\n'
+            ":cleanup\r\n"
+            f'del /Q "{batch_download}" >NUL 2>&1\r\n'
+            'del /Q "%~f0"\r\n'
+        )
+        try:
+            with open(script_path, "w", encoding="ascii", newline="") as output:
+                output.write(script)
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.Popen(
+                ["cmd.exe", "/c", script_path], cwd=os.path.dirname(executable),
+                creationflags=creation_flags, close_fds=True,
+            )
+        except OSError as exc:
+            try:
+                os.remove(downloaded_path)
+            except OSError:
+                pass
+            self._update_install_failed(str(exc))
+            return
+        self.update_status_var.set(f"Installing version {update['version']}...")
+        self.log(f"Installing LeagueArenaTools v{update['version']} and restarting.")
+        self.root.after(150, self._final_close)
 
     def _on_ban_change(self, names):
         self.live_config["ban_priority"] = names
@@ -3178,7 +3472,7 @@ class App:
         self._sync_custom_status_draft()
         self.bot.stop()
         self.bot_running = False
-        for after_id in (self._poll_after_id, self._save_after_id):
+        for after_id in (self._poll_after_id, self._save_after_id, self._update_check_after_id):
             if after_id is not None:
                 try:
                     self.root.after_cancel(after_id)

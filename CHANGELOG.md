@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.01
+
+- Added automatic update checks through GitHub Releases.
+- Added verified in-app EXE downloads and restart-based installation.
+- Required GitHub-provided SHA-256 digests before installing an update.
+
 ## 1.00
 
 - Renamed the application to LeagueArenaTools.

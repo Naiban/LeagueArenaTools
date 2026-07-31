@@ -20,6 +20,7 @@ Legends client actions through the local League Client API (LCU).
 - Multiple named configuration profiles
 - Optional ntfy phone notifications
 - Notification-area operation
+- Automatic update checks with SHA-256-verified installation
 
 Profile creation, activation, and deletion are disabled while the bot is
 running. Stop the bot before switching configurations.
@@ -31,6 +32,12 @@ Download `LeagueArenaTools.exe` from the
 The executable is currently unsigned, so Windows SmartScreen or antivirus
 software may show a warning until the project establishes reputation or the
 binary is digitally signed.
+
+Automatic update checks use the public GitHub Releases API and do not contain
+or request a GitHub access token. They therefore become available when this
+repository is public. While it is private, the application reports that the
+update service is unavailable. Automatic installation is supported by the
+packaged EXE; source runs can check releases but do not replace source files.
 
 ## Run from source
 
@@ -70,8 +77,11 @@ LeagueArenaTools communicates with:
 - the local League Client API on `127.0.0.1`;
 - the local Live Client API on `127.0.0.1`;
 - `ntfy.sh` only when phone notifications are enabled.
+- `api.github.com` and GitHub release download hosts for update checks and
+  SHA-256-verified updates.
 
-It does not download or execute programs.
+It only downloads executable updates after confirmation, and installs them
+when their size and GitHub-provided SHA-256 digest match the release metadata.
 
 ## Disclaimer
 
