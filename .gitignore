@@ -1,0 +1,11 @@
+__pycache__/
+build/
+dist/
+.claude/
+*.pyc
+league_arena_tools_config.json
+shinkansen_config.json
+Shink*.py
+Shink*.spec
+shinkansen.ico
+shinkansen.png
