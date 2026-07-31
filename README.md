@@ -9,10 +9,12 @@ Legends client actions through the local League Client API (LCU).
 
 <img width="1076" height="757" alt="obraz" src="https://github.com/user-attachments/assets/f4be21c3-c540-4223-ac55-7135ee914a39" />
 <img width="1077" height="751" alt="obraz" src="https://github.com/user-attachments/assets/c5ed3176-30c2-45b3-95d4-4a48a03a8ff5" />
+
 ## Warning
 - App is fully optimized for Arena Gamemode and not tested in other gamemodes
-## Features
+- LCU is forbidden to use at korean server
 
+## Features
 - 👦🏾Auto Accept 
 - 👩🏿‍🦯Instant Hover&Pick&Ban (Bravery Pick Option)
 - 🛀🏿Automatic champion hover
@@ -50,11 +52,6 @@ python -m PyInstaller --noconfirm --clean LeagueArenaTools.spec
 ```
 
 The executable is written to `dist/LeagueArenaTools.exe`.
-
-## Configuration
-
-Settings are stored next to the source file or executable in
-`league_arena_tools_config.json`. The file supports multiple configs.
 
 ## Network access
 
