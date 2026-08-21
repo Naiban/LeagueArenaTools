@@ -2311,8 +2311,11 @@ class App:
         self.var_delay_ms = tk.IntVar(value=int(cfg.get("delay_ms", 500)))
 
         self.session_stats = dict(DEFAULT_STATS)
-        self.stat_vars = {key: tk.StringVar(value="0") for key, _ in STAT_ITEMS}
-        self.alltime_var = tk.StringVar(value="")
+        self.stat_total_vars = {key: tk.StringVar(value="0") for key, _ in STAT_ITEMS}
+        self.stat_session_vars = {
+            key: tk.StringVar(value="+0 this run") for key, _ in STAT_ITEMS
+        }
+        self.stat_session_labels = {}
 
         bindings = (
             ("auto_accept", self.var_accept, self._bind_bool),
@@ -2479,7 +2482,7 @@ class App:
         self._build_stats_card(page)
 
     def _build_stats_card(self, page):
-        card = Card(page, "Session Stats")
+        card = Card(page, "Statistics")
         card.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         strip = tk.Frame(card.body, bg=PANEL_BG)
         strip.pack(fill="x")
@@ -2492,10 +2495,13 @@ class App:
             block.pack(side="left", fill="both", expand=True)
             tk.Label(block, text=label, bg=PANEL_BG, fg=TEXT_MUTED,
                      font=("Segoe UI", 7, "bold")).pack(anchor="w")
-            tk.Label(block, textvariable=self.stat_vars[key], bg=PANEL_BG,
+            tk.Label(block, textvariable=self.stat_total_vars[key], bg=PANEL_BG,
                      fg=TEXT_PRIMARY, font=("Segoe UI", 13, "bold")).pack(anchor="w")
-        tk.Label(card.body, textvariable=self.alltime_var, bg=PANEL_BG,
-                 fg=TEXT_MUTED, font=("Segoe UI", 8)).pack(anchor="w", pady=(8, 0))
+            session_label = tk.Label(block, textvariable=self.stat_session_vars[key],
+                                     bg=PANEL_BG, fg=TEXT_MUTED,
+                                     font=("Segoe UI", 8))
+            session_label.pack(anchor="w")
+            self.stat_session_labels[key] = session_label
         self._refresh_stat_labels()
 
     def _on_stat_event(self, key):
@@ -2516,18 +2522,17 @@ class App:
             pass
 
     def _refresh_stat_labels(self):
-        for key, variable in self.stat_vars.items():
-            variable.set(str(self.session_stats.get(key, 0)))
         totals = self.profile_store["stats"]
-        self.alltime_var.set(
-            "All time: "
-            + " · ".join((
-                f"{totals['accepted']} accepted",
-                f"{totals['picked']} picked",
-                f"{totals['games']} games",
-                f"{totals['dodged']} dodges",
-            ))
-        )
+        for key, variable in self.stat_total_vars.items():
+            variable.set(str(totals.get(key, 0)))
+            count = self.session_stats.get(key, 0)
+            self.stat_session_vars[key].set(f"+{count} this run")
+            try:
+                # Highlight the live counter only once something happened.
+                self.stat_session_labels[key].configure(
+                    fg=ACCENT_ALT if count else TEXT_MUTED)
+            except (KeyError, tk.TclError):
+                pass
 
     def _reset_stats(self):
         if not messagebox.askyesno(
