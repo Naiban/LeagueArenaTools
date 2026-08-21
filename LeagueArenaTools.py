@@ -400,6 +400,9 @@ ARENA_DATA_URL = CDRAGON_BASE_URL + "/cdragon/arena/en_us.json"
 ITEMS_DATA_URL = (
     CDRAGON_BASE_URL + "/plugins/rcp-be-lol-game-data/global/default/v1/items.json"
 )
+CHERRY_AUGMENTS_URL = (
+    CDRAGON_BASE_URL + "/plugins/rcp-be-lol-game-data/global/default/v1/cherry-augments.json"
+)
 PLATFORM_TO_AS_REGION = {
     "EUW1": "euw", "EUN1": "eune", "NA1": "na", "BR1": "br", "LA1": "las",
     "LA2": "lan", "OC1": "oce", "TR1": "tr", "RU": "ru", "JP1": "jp",
@@ -2554,6 +2557,7 @@ class App:
         self._icon_photo_cache = {}       # (url, size) -> PhotoImage | None
         self._history_icon_refs = []
         self._tooltip = None
+        self._tooltip_after_id = None
         self._current_detail_view = None
         self._history_token = 0
         self._elo_cell_vars = {}
@@ -3109,6 +3113,7 @@ class App:
         canvas.configure(yscrollcommand=detail_scroll.set)
         canvas.pack(side="left", fill="both", expand=True)
         detail_scroll.pack(side="right", fill="y")
+        self.history_detail_canvas = canvas
         tk.Label(self.history_detail_inner,
                  text="Select a game to see items,\naugments and lobby ratings.",
                  bg=PANEL_BG, fg=TEXT_MUTED, font=("Segoe UI", 10),
@@ -3193,6 +3198,29 @@ class App:
                                 "icon_urls": cdragon_icon_candidates(icon),
                                 "tooltip": clean_game_text(entry.get("desc")),
                             }
+            except Exception:
+                pass
+            # Secondary source: newer Arena augments land here first.
+            try:
+                response = requests.get(CHERRY_AUGMENTS_URL, timeout=(5, 30))
+                if response.status_code == 200:
+                    for entry in response.json():
+                        try:
+                            aug_id = int(entry.get("id"))
+                        except (TypeError, ValueError):
+                            continue
+                        if aug_id in augments:
+                            continue
+                        name = entry.get("nameTRA") or entry.get("augmentNameId")
+                        if not isinstance(name, str) or not name.strip():
+                            continue
+                        icon = (entry.get("augmentLargeIconPath")
+                                or entry.get("augmentSmallIconPath") or "")
+                        augments[aug_id] = {
+                            "name": name.strip(),
+                            "icon_urls": cdragon_icon_candidates(icon),
+                            "tooltip": "",
+                        }
             except Exception:
                 pass
 
@@ -3384,21 +3412,48 @@ class App:
         threading.Thread(target=worker, daemon=True, name="LAT-Icon").start()
 
     def _show_tooltip(self, widget, text):
+        """Single delayed tooltip, positioned below-right and screen-clamped."""
         self._hide_tooltip()
-        try:
-            x = widget.winfo_rootx() + 12
-            y = widget.winfo_rooty() - 34
-            tip = tk.Toplevel(self.root)
-            tip.wm_overrideredirect(True)
-            tip.wm_geometry(f"+{x}+{y}")
-            tk.Label(tip, text=text, bg="#1c2438", fg=TEXT_PRIMARY,
-                     relief="solid", bd=1, font=("Segoe UI", 9),
-                     justify="left", wraplength=420).pack(ipadx=8, ipady=5)
-            self._tooltip = tip
-        except Exception:
-            self._tooltip = None
+        if not text:
+            return
+
+        def reveal():
+            self._tooltip_after_id = None
+            if self._closing:
+                return
+            try:
+                tip = tk.Toplevel(self.root)
+                tip.wm_overrideredirect(True)
+                tk.Label(tip, text=text, bg="#1c2438", fg=TEXT_PRIMARY,
+                         relief="solid", bd=1, font=("Segoe UI", 9),
+                         justify="left", wraplength=420).pack(ipadx=8, ipady=5)
+                tip.update_idletasks()
+                screen_w = widget.winfo_screenwidth()
+                screen_h = widget.winfo_screenheight()
+                width = tip.winfo_reqwidth()
+                height = tip.winfo_reqheight()
+                x = widget.winfo_rootx() + 14
+                y = widget.winfo_rooty() + max(1, widget.winfo_height()) + 8
+                if x + width > screen_w - 10:
+                    x = max(10, screen_w - width - 10)
+                if y + height > screen_h - 10:
+                    # Not enough space below - place above the chip instead.
+                    y = max(10, widget.winfo_rooty() - height - 8)
+                tip.wm_geometry(f"+{int(x)}+{int(y)}")
+                self._tooltip = tip
+            except Exception:
+                self._tooltip = None
+
+        self._tooltip_after_id = self.root.after(200, reveal)
 
     def _hide_tooltip(self, _event=None):
+        after_id = getattr(self, "_tooltip_after_id", None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+            self._tooltip_after_id = None
         tip = getattr(self, "_tooltip", None)
         if tip is not None:
             try:
