@@ -3,7 +3,6 @@ import re
 import sys
 import json
 import copy
-import time
 import random
 import base64
 import secrets
@@ -14,7 +13,7 @@ from datetime import datetime
 from urllib.parse import unquote, urlparse
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext, simpledialog, messagebox
+from tkinter import scrolledtext, simpledialog, messagebox
 
 import requests
 import psutil
@@ -176,7 +175,6 @@ DEFAULT_CONFIG = {
     "delay_ms": 500,
     "favorites": [],
     "favorites_expanded": False,
-    "poll_interval": 0.25,
     "push_enabled": False,
     "push_topic": "",
     "push_events": {
@@ -279,7 +277,6 @@ class LCUClient:
         # encryption, but do not disable verification globally for ntfy or
         # other external requests.
         self.session.verify = False
-        self._openapi_cache = None
 
     @property
     def is_connected(self):
@@ -297,7 +294,6 @@ class LCUClient:
         self.port = None
         self.token = None
         self.base_url = None
-        self._openapi_cache = None
         self.session.headers.pop("Authorization", None)
 
     def _find_credentials(self):
@@ -337,23 +333,6 @@ class LCUClient:
 
     def patch(self, path, json=None):
         return self.session.patch(self.base_url + path, json=json, timeout=5)
-
-    def request(self, method, path, json=None):
-        return self.session.request(method.upper(), self.base_url + path, json=json, timeout=5)
-
-    def get_openapi(self):
-        if self._openapi_cache is not None:
-            return self._openapi_cache
-        for path in ("/swagger/v3/openapi.json", "/swagger/v2/swagger.json"):
-            try:
-                r = self.get(path)
-                if r.status_code == 200:
-                    self._openapi_cache = r.json()
-                    return self._openapi_cache
-            except Exception:
-                pass
-        self._openapi_cache = {}
-        return self._openapi_cache
 
     def websocket_url(self):
         if not self.port:
@@ -517,7 +496,6 @@ class LeagueArenaToolsBot:
         self._last_action_debug = ""
         self._last_hover_log = ""
         self._last_phase = None
-        self._last_queue_id = None
         self._requeue_suppressed = False
         self._requeue_worker_running = False
         self._requeue_worker_lock = threading.Lock()
@@ -733,26 +711,24 @@ class LeagueArenaToolsBot:
             self._stop_game_loaded_watch()
 
         if phase == "Lobby" and previous_phase != "Lobby":
-            self._capture_queue_id()
-            self._requeue_suppressed = False
+            if previous_phase in ("Matchmaking", "ReadyCheck"):
+                # Back in the lobby without a game starting: the queue was
+                # cancelled (X on the timer) or the ready check was declined.
+                # Stand down until a dodge or a finished game brings up the
+                # next lobby, or until the player searches manually.
+                self._requeue_suppressed = True
+                self.log("Auto re-queue: queue cancelled - standing by.")
+            else:
+                # Fresh lobby (dodge, post-game, or newly created): requeue
+                # again.
+                self._requeue_suppressed = False
             self._maybe_auto_requeue()
 
         if phase == "ChampSelect" and previous_phase != "ChampSelect":
-            self._capture_queue_id()
             self._send_champ_select_message()
 
         if phase == "None" and previous_phase in ("WaitingForStats", "PreEndOfGame", "EndOfGame"):
             self._maybe_auto_rejoin_lobby()
-
-    def _capture_queue_id(self):
-        try:
-            resp = self.client.get("/lol-lobby/v2/lobby")
-            if resp.status_code == 200:
-                queue_id = (resp.json().get("gameConfig") or {}).get("queueId")
-                if isinstance(queue_id, int) and queue_id > 0:
-                    self._last_queue_id = queue_id
-        except Exception:
-            pass
 
     def _send_champ_select_message(self):
         stop_event = self._stop_event
@@ -824,9 +800,6 @@ class LeagueArenaToolsBot:
         stop_event = self._stop_event
         if not self._is_active(stop_event) or not self.config.get("auto_requeue_enabled"):
             return
-        if not self._last_queue_id:
-            self.log("Auto re-queue: no queue type remembered, skipping lobby rejoin.")
-            return
         if self._rejoin_thread is not None and self._rejoin_thread.is_alive():
             return
         self._rejoin_thread = threading.Thread(
@@ -838,8 +811,9 @@ class LeagueArenaToolsBot:
         self._rejoin_thread.start()
 
     def _auto_rejoin_lobby_worker(self, stop_event):
-        # Give the client a moment - it sometimes recreates the lobby itself
-        # after a match ends, before we try to do it manually.
+        # After a game the client normally recreates the lobby itself. Wait
+        # for it and NEVER create a lobby here - if no lobby exists the
+        # player left or disbanded on purpose and we stay stopped.
         if not self._wait(1.5, stop_event):
             return
         if not self._is_active(stop_event):
@@ -847,35 +821,11 @@ class LeagueArenaToolsBot:
         try:
             existing = self.client.get("/lol-lobby/v2/lobby")
             if existing.status_code == 200 and existing.json():
-                # Lobby already exists (client recreated it itself) - the
-                # regular Lobby-entry hook will handle it, nothing else to do.
+                # Lobby exists - the regular Lobby-entry hook starts the search.
                 return
         except Exception:
             pass
-
-        if not self._is_active(stop_event):
-            return
-        try:
-            resp = self._request_if_active(
-                stop_event,
-                self.client.post,
-                "/lol-lobby/v2/lobby",
-                {"queueId": self._last_queue_id},
-            )
-            if resp is None:
-                return
-            if resp.status_code not in (200, 201, 204):
-                self.log(f"Auto re-queue: failed to recreate lobby (status {resp.status_code}).")
-                return
-        except Exception as e:
-            self.log(f"Auto re-queue: error recreating lobby: {e}")
-            return
-
-        if not self._is_active(stop_event):
-            return
-        self.log("Auto re-queue: lobby recreated, starting search.")
-        self._requeue_suppressed = False
-        self._start_requeue_worker(stop_event)
+        self.log("Auto re-queue: no lobby found after the game - standing by.")
 
     def _is_matchmaking_searching(self, stop_event=None):
         if stop_event is not None and not self._is_active(stop_event):
@@ -1176,10 +1126,6 @@ class LeagueArenaToolsBot:
         return None
 
     @staticmethod
-    def _action_has_champion(action, champion_id):
-        return bool(action and action.get("championId") == champion_id)
-
-    @staticmethod
     def _walk_values(value):
         if isinstance(value, dict):
             yield value
@@ -1310,9 +1256,6 @@ class LeagueArenaToolsBot:
                 self.log(f"Unknown champion: '{label}' - skipping in priority list")
         return entries
 
-    def _resolve_priority_ids(self, names):
-        return [entry for entry, _ in self._resolve_priority_entries(names) if isinstance(entry, int)]
-
     @staticmethod
     def _extract_champion_ids(payload):
         ids = set()
@@ -1416,45 +1359,6 @@ class LeagueArenaToolsBot:
         else:
             self.log(f"Failed to complete action '{kind}'")
             return False
-
-    def _instant_action_legacy(self, action_id, kind, champion_id):
-        stop_event = self._stop_event
-        if not self._is_active(stop_event):
-            return False
-        paths = [
-            (self.client.patch, f"/lol-champ-select/v1/session/actions/{action_id}", {"championId": champion_id, "completed": True}),
-            (self.client.post, f"/lol-champ-select/v1/session/actions/{action_id}/complete", None),
-            (self.client.patch, f"/lol-champ-select/v1/session/actions/{action_id}", {"championId": champion_id}),
-            (self.client.patch, f"/lol-champ-select/v1/session/actions/{action_id}", {"completed": True}),
-        ]
-        if kind == "pick":
-            paths.insert(2, (
-                self.client.patch,
-                "/lol-champ-select/v1/session/my-selection",
-                {"championId": champion_id},
-            ))
-
-        statuses = []
-        for func, path, body in paths:
-            if not self._is_active(stop_event):
-                return False
-            try:
-                resp = func(path, json=body)
-                statuses.append(f"{path}:{resp.status_code}")
-            except Exception as e:
-                statuses.append(f"{path}:ERR {e}")
-
-        for _ in range(6):
-            action = self._get_action_by_id(action_id)
-            if action and action.get("completed"):
-                label = "Banned" if kind == "ban" else "Picked"
-                self.log(f"{label} champion: {self.champion_data.label(champion_id)}")
-                return True
-            if not self._wait(0.05, stop_event):
-                return False
-
-        self.log(f"Instant {kind} unconfirmed: " + " | ".join(statuses))
-        return False
 
     def _instant_action(self, action_id, kind, champion_id):
         stop_event = self._stop_event
@@ -1588,39 +1492,6 @@ class LeagueArenaToolsBot:
             return self._wait(delay_ms / 1000, self._stop_event)
         return self._is_active()
 
-    @staticmethod
-    def _looks_like_bravery(value):
-        if isinstance(value, str):
-            normalized = _normalize(value)
-            return normalized in ("bravery", "arenabravery", "random", "randomchampion")
-        return False
-
-    def _complete_bravery_action(self, action_id):
-        stop_event = self._stop_event
-        if not self._is_active(stop_event):
-            return False
-        attempts = [
-            (self.client.post, f"/lol-champ-select/v1/session/actions/{action_id}/complete", None),
-            (self.client.patch, f"/lol-champ-select/v1/session/actions/{action_id}", {"completed": True}),
-            (self.client.post, f"/lol-lobby-team-builder/champ-select/v1/session/actions/{action_id}/complete", None),
-            (self.client.patch, f"/lol-lobby-team-builder/champ-select/v1/session/actions/{action_id}", {"completed": True}),
-        ]
-        statuses = []
-        ok = False
-        for func, path, body in attempts:
-            if not self._is_active(stop_event):
-                return False
-            try:
-                resp = func(path, json=body)
-                statuses.append(f"{path}:{resp.status_code}")
-                if resp.status_code in (200, 204):
-                    ok = True
-            except Exception as e:
-                statuses.append(f"{path}:ERR {e}")
-        if ok:
-            self.log("Bravery complete sent: " + " | ".join(statuses))
-        return ok
-
     def _perform_bravery(self, action_id, timer_ms, instant=False):
         if not self._is_active():
             return False
@@ -1659,10 +1530,6 @@ TEXT_MUTED = "#91a0bd"
 SUCCESS = "#34d399"
 DANGER = "#fb7185"
 WARNING = "#fbbf24"
-AERO_DARK = ACCENT         # alias for compatibility with any references
-BODY_BG = BG
-TEXT_DARK = TEXT_PRIMARY
-BORDER = PANEL_BORDER
 WIN_W = 1080
 WIN_H = 760
 
@@ -1948,31 +1815,6 @@ class Card(tk.Frame):
 # =============================================================================
 # 5) CHAMPION SELECTION WIDGETS (search + list, alphabetical, filtered)
 # =============================================================================
-
-class ScrollableArea(tk.Frame):
-    """Scrollable container for the entire window content."""
-
-    def __init__(self, parent, bg=BG):
-        super().__init__(parent, bg=bg)
-        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0)
-        self.scrollbar = tk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.inner = tk.Frame(self.canvas, bg=bg)
-
-        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self._window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
-        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfig(self._window, width=e.width))
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
-
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.scrollbar.pack(side="right", fill="y")
-
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-        self.canvas.bind_all("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
-        self.canvas.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
-
-    def _on_mousewheel(self, event):
-        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
 
 class PriorityListEditor(tk.Frame):
     """Champion search + priority list. Enter/double-click adds,
