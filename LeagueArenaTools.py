@@ -394,11 +394,36 @@ ARENASWEATS_REGIONS = (
     "euw", "na", "eune", "kr", "jp", "br", "las", "lan",
     "oce", "tr", "ru", "sea", "tw", "vn", "me",
 )
+CDRAGON_BASE_URL = "https://raw.communitydragon.org/latest"
+ARENA_DATA_URL = CDRAGON_BASE_URL + "/cdragon/arena/en_us.json"
+ITEMS_DATA_URL = (
+    CDRAGON_BASE_URL + "/plugins/rcp-be-lol-game-data/global/default/v1/items.json"
+)
+PLATFORM_TO_AS_REGION = {
+    "EUW1": "euw", "EUN1": "eune", "NA1": "na", "BR1": "br", "LA1": "las",
+    "LA2": "lan", "OC1": "oce", "TR1": "tr", "RU": "ru", "JP1": "jp",
+    "KR": "kr", "ME1": "me",
+}
 QUEUE_LABELS = {
-    1700: "Arena", 1090: "Ranked Arena",
+    1700: "Arena", 1090: "Ranked Arena", 1740: "Arena", 1750: "Arena",
     420: "Ranked Solo/Duo", 440: "Ranked Flex",
     400: "Draft Pick", 430: "Blind Pick", 450: "ARAM",
 }
+
+
+def cdragon_asset_url(icon_path):
+    """Map a game asset path to its raw.communitydragon.org URL."""
+    if not isinstance(icon_path, str) or not icon_path.strip():
+        return None
+    lowered = icon_path.replace("\\", "/").strip().lower()
+    marker = "/lol-game-data/assets/"
+    if marker in lowered:
+        rel = lowered.split(marker, 1)[1]
+    else:
+        rel = lowered.lstrip("/")
+    if not rel:
+        return None
+    return f"{CDRAGON_BASE_URL}/plugins/rcp-be-lol-game-data/global/default/{rel}"
 
 
 def generate_push_topic():
@@ -1602,11 +1627,32 @@ def _walk_nodes(value):
 
 
 def find_placement(participant):
-    for node in _walk_nodes(participant):
-        for key in ("placement", "finalPlacement", "placing"):
-            value = node.get(key)
+    # Arena stores the DUO placement in stats.subteamPlacement.
+    for key in ("subteamPlacement", "placement", "finalPlacement", "placing"):
+        value = participant.get(key)
+        if isinstance(value, int) and 0 < value <= 20:
+            return value
+    stats = participant.get("stats")
+    if isinstance(stats, dict):
+        for key in ("subteamPlacement", "placement", "finalPlacement", "placing"):
+            value = stats.get(key)
             if isinstance(value, int) and 0 < value <= 20:
                 return value
+    return None
+
+
+def _win_flag(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text == "win":
+            return True
+        if text in ("fail", "loss", "lose"):
+            return False
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
     return None
 
 
@@ -1626,24 +1672,39 @@ def prettify_augment(raw):
 
 
 def collect_augments(participant):
-    found = []
+    """Ordered raw augment identifiers for a participant.
+
+    Arena matches carry stats.playerAugment1..6 (ints, 0 = empty slot); the
+    generic scan is only a fallback for other payload shapes.
+    """
+    ids = []
     seen = set()
+    stats = participant.get("stats") if isinstance(participant, dict) else {}
+    if isinstance(stats, dict):
+        for slot in range(1, 7):
+            raw = stats.get(f"playerAugment{slot}")
+            if isinstance(raw, int) and raw > 0 and raw not in seen:
+                seen.add(raw)
+                ids.append(raw)
     for node in _walk_nodes(participant):
         for key, value in node.items():
-            if "augment" not in key.lower():
+            lowered = key.lower()
+            if "augment" not in lowered or lowered.startswith("playeraugment"):
                 continue
             candidates = value if isinstance(value, (list, tuple)) else [value]
             for raw in candidates:
                 if isinstance(raw, bool):
                     continue
-                if not isinstance(raw, (int, str)):
-                    continue
-                marker = (type(raw).__name__, raw)
-                if marker in seen:
-                    continue
-                seen.add(marker)
-                found.append(prettify_augment(raw))
-    return [text for text in found if text][:8]
+                if isinstance(raw, int):
+                    if raw > 0 and raw not in seen:
+                        seen.add(raw)
+                        ids.append(raw)
+                elif isinstance(raw, str) and raw.strip():
+                    text = raw.strip()
+                    if text not in seen:
+                        seen.add(text)
+                        ids.append(text)
+    return ids[:8]
 
 
 def parse_history_games(payload):
@@ -1677,7 +1738,6 @@ def summarize_history_game(game):
     kills = _stats_int(stats, "kills", default=0)
     deaths = _stats_int(stats, "deaths", default=0)
     assists = _stats_int(stats, "assists", default=0)
-    win = stats.get("win")
     return {
         "game_id": game.get("gameId"),
         "queue_id": game.get("queueId"),
@@ -1685,7 +1745,7 @@ def summarize_history_game(game):
         "duration_s": game.get("gameDuration"),
         "champion_id": me.get("championId"),
         "placement": find_placement(me),
-        "win": bool(win) if isinstance(win, (bool, int)) else None,
+        "win": _win_flag(stats.get("win")),
         "kda": f"{kills}/{deaths}/{assists}",
     }
 
@@ -1711,8 +1771,10 @@ def parse_match_detail(payload):
             "account_id": player.get("currentAccountId", player.get("accountId")),
             "puuid": player.get("puuid"),
             "champion_id": part.get("championId"),
+            "subteam_id": stats.get("playerSubteamId")
+                          if isinstance(stats.get("playerSubteamId"), int) else None,
             "placement": find_placement(part),
-            "win": bool(stats["win"]) if isinstance(stats.get("win"), (bool, int)) else None,
+            "win": _win_flag(stats.get("win")),
             "kills": _stats_int(stats, "kills", default=0),
             "deaths": _stats_int(stats, "deaths", default=0),
             "assists": _stats_int(stats, "assists", default=0),
@@ -2447,7 +2509,14 @@ class App:
         self._match_summaries = []
         self._detail_cache = {}
         self._elo_cache = {}
-        self._history_items_map = None
+        self._history_items_map = {}      # item id -> {"name", "icon_url"}
+        self._history_augments_map = {}   # augment id -> {"name", "icon_url"}
+        self._history_meta_loaded = False
+        self._history_loading_meta = False
+        self._icon_photo_cache = {}       # (url, size) -> PhotoImage | None
+        self._history_icon_refs = []
+        self._tooltip = None
+        self._current_detail_view = None
         self._history_token = 0
         self._elo_cell_vars = {}
 
@@ -2989,6 +3058,88 @@ class App:
         if not self._closing:
             self.history_status_var.set(text)
 
+    def _detect_arena_region(self):
+        """Map the connected League platform to an arenasweats region."""
+
+        def worker():
+            platform = ""
+            try:
+                response = self.client.get("/lol-chat/v1/me")
+                if response.status_code == 200:
+                    platform = str(response.json().get("platformId") or "").upper()
+            except Exception:
+                pass
+            if not platform:
+                try:
+                    response = self.client.get(
+                        "/lol-match-history/v1/products/lol/current-summoner/matches"
+                        "?begIndex=0&endIndex=0")
+                    if response.status_code == 200:
+                        games = parse_history_games(response.json())
+                        if games:
+                            platform = str(games[0].get("platformId") or "").upper()
+                except Exception:
+                    pass
+            region = PLATFORM_TO_AS_REGION.get(platform)
+            if region and region != self.var_history_region.get():
+                def apply():
+                    self.var_history_region.set(region)
+                    self.log(f"History: League region detected ({platform}) - "
+                             f"ratings region set to '{region}'.")
+                self._run_on_ui(apply)
+
+        threading.Thread(target=worker, daemon=True, name="LAT-RegionDetect").start()
+
+    def _ensure_history_metadata(self):
+        """Load item/augment names + icon URLs from CommunityDragon once."""
+        if self._history_meta_loaded or self._history_loading_meta:
+            return
+        self._history_loading_meta = True
+
+        def worker():
+            items, augments = {}, {}
+            try:
+                response = requests.get(ITEMS_DATA_URL, timeout=(5, 30))
+                if response.status_code == 200:
+                    for entry in response.json():
+                        item_id, name = entry.get("id"), entry.get("name")
+                        if isinstance(item_id, int) and isinstance(name, str) and name:
+                            items[item_id] = {
+                                "name": name,
+                                "icon_url": cdragon_asset_url(entry.get("iconPath")),
+                            }
+            except Exception:
+                pass
+            try:
+                response = requests.get(ARENA_DATA_URL, timeout=(5, 30))
+                if response.status_code == 200:
+                    for entry in response.json().get("augments") or []:
+                        aug_id, name = entry.get("id"), entry.get("name")
+                        if isinstance(aug_id, int) and isinstance(name, str) and name:
+                            icon = entry.get("iconLarge") or entry.get("iconSmall") or ""
+                            augments[aug_id] = {
+                                "name": name,
+                                "icon_url": cdragon_asset_url(icon),
+                            }
+            except Exception:
+                pass
+
+            def apply():
+                self._history_loading_meta = False
+                self._history_items_map = items or self._history_items_map
+                self._history_augments_map = augments or self._history_augments_map
+                self._history_meta_loaded = True
+                # Re-render the open match so names/icons appear without a re-click.
+                if self._current_detail_view is not None:
+                    try:
+                        self._render_history_detail(self._current_detail_view)
+                    except tk.TclError:
+                        pass
+
+            self._run_on_ui(apply)
+
+        threading.Thread(target=worker, daemon=True, name="LAT-HistoryMeta").start()
+
     def _load_history(self):
         if self._closing or self._history_loading:
             return
@@ -3001,18 +3152,10 @@ class App:
                 return
         self._history_loading = True
         self._set_history_status("Loading recent games...")
+        self._detect_arena_region()
+        self._ensure_history_metadata()
 
         def worker():
-            items = {}
-            try:
-                response = self.client.get("/lol-game-data/items.json")
-                if response.status_code == 200:
-                    for item in response.json():
-                        item_id, name = item.get("id"), item.get("name")
-                        if isinstance(item_id, int) and isinstance(name, str) and name:
-                            items[item_id] = name
-            except Exception:
-                pass
             games, error = [], None
             try:
                 response = self.client.get(
@@ -3030,8 +3173,6 @@ class App:
                 if self._closing:
                     return
                 self._history_loading = False
-                if items:
-                    self._history_items_map = items
                 self._fill_history_list(summaries, error)
 
             self._run_on_ui(finish)
@@ -3107,11 +3248,128 @@ class App:
 
         threading.Thread(target=worker, daemon=True, name="LAT-HistoryDetail").start()
 
+    def _resolve_entry(self, entry_id, kind):
+        """entry id -> display dict {"name", "url", "fallback"}."""
+        mapping = (self._history_items_map if kind == "item"
+                   else self._history_augments_map)
+        info = mapping.get(entry_id)
+        if isinstance(info, dict):
+            return {"name": info.get("name") or str(entry_id),
+                    "url": info.get("icon_url"), "fallback": None}
+        prefix = "Item" if kind == "item" else "Augment"
+        return {"name": f"{prefix} {entry_id}", "url": None,
+                "fallback": f"{prefix[0]}{entry_id}"}
+
+    def _icon_for(self, url, size, callback):
+        """Fetch an icon asynchronously; callback(photo|None) runs on the UI thread."""
+        if not url:
+            self._run_on_ui(lambda: callback(None))
+            return
+        key = (url, size)
+        if key in self._icon_photo_cache:
+            photo = self._icon_photo_cache[key]
+
+            def hit():
+                callback(photo)
+            self._run_on_ui(hit)
+            return
+
+        def worker():
+            pil_image = None
+            try:
+                import io
+                from PIL import Image as PILImage
+                data = requests.get(url, timeout=(5, 15)).content
+                pil_image = PILImage.open(io.BytesIO(data)).convert("RGBA")
+                pil_image.thumbnail((size * 2, size * 2))
+            except Exception:
+                pil_image = None
+
+            def make():
+                try:
+                    from PIL import ImageTk
+                    photo = ImageTk.PhotoImage(pil_image) if pil_image is not None else None
+                except Exception:
+                    photo = None
+                self._icon_photo_cache[key] = photo
+                if photo is not None:
+                    self._history_icon_refs.append(photo)
+                callback(photo)
+
+            self._run_on_ui(make)
+
+        threading.Thread(target=worker, daemon=True, name="LAT-Icon").start()
+
+    def _show_tooltip(self, widget, text):
+        self._hide_tooltip()
+        try:
+            x = widget.winfo_rootx() + 12
+            y = widget.winfo_rooty() - 34
+            tip = tk.Toplevel(self.root)
+            tip.wm_overrideredirect(True)
+            tip.wm_geometry(f"+{x}+{y}")
+            tk.Label(tip, text=text, bg="#1c2438", fg=TEXT_PRIMARY,
+                     relief="solid", bd=1, font=("Segoe UI", 9),
+                     justify="left").pack(ipadx=6, ipady=3)
+            self._tooltip = tip
+        except Exception:
+            self._tooltip = None
+
+    def _hide_tooltip(self, _event=None):
+        tip = getattr(self, "_tooltip", None)
+        if tip is not None:
+            try:
+                tip.destroy()
+            except Exception:
+                pass
+            self._tooltip = None
+
+    def _toggle_player_build(self, player, panel_holder):
+        """Expand/collapse one player's full build below their lobby row."""
+        existing = None
+        for child in panel_holder.winfo_children():
+            existing = child
+            break
+        if existing is not None:
+            self._hide_tooltip()
+            existing.destroy()
+            return
+        build = tk.Frame(panel_holder, bg="#0e1422",
+                         highlightthickness=1,
+                         highlightcolor=PANEL_BORDER,
+                         highlightbackground=PANEL_BORDER)
+        build.pack(fill="x", pady=(2, 4))
+        inner = tk.Frame(build, bg="#0e1422")
+        inner.pack(fill="x", padx=10, pady=8)
+        items = [self._resolve_entry(item_id, "item")
+                 for item_id in player.get("items", [])]
+        augments = [self._resolve_entry(aug_id, "augment")
+                    for aug_id in player.get("augments", [])]
+        if not items and not augments:
+            tk.Label(inner, text="No build data recorded.",
+                     bg="#0e1422", fg=TEXT_MUTED,
+                     font=("Segoe UI", 8)).pack(anchor="w")
+            return
+        if items:
+            tk.Label(inner, text="ITEMS", bg="#0e1422", fg=TEXT_MUTED,
+                     font=("Segoe UI", 7, "bold")).pack(anchor="w")
+            items_row = tk.Frame(inner, bg="#0e1422")
+            items_row.pack(anchor="w")
+            self._build_chips_into(items_row, items)
+        if augments:
+            tk.Label(inner, text="AUGMENTS", bg="#0e1422", fg=TEXT_MUTED,
+                     font=("Segoe UI", 7, "bold")).pack(anchor="w", pady=(6, 0))
+            augments_row = tk.Frame(inner, bg="#0e1422")
+            augments_row.pack(anchor="w")
+            self._build_chips_into(augments_row, augments)
+
     def _render_history_detail(self, view):
         host = self.history_detail_inner
         for child in host.winfo_children():
             child.destroy()
+        self._hide_tooltip()
         self._elo_cell_vars = {}
+        self._current_detail_view = view
         self._history_token += 1
         token = self._history_token
 
@@ -3162,29 +3420,59 @@ class App:
         tk.Label(box, text=kda_line, bg=PANEL_BG, fg=TEXT_PRIMARY,
                  font=("Segoe UI", 9)).pack(anchor="w", pady=(6, 0))
 
-        items_map = self._history_items_map or {}
-        item_names = [items_map.get(item_id, f"Item {item_id}")
-                      for item_id in me.get("items", [])]
-        self._detail_section(box, "ITEMS",
-                             " · ".join(item_names) if item_names else "-")
-        augments = me.get("augments") or []
-        self._detail_section(box, "AUGMENTS",
-                             "  ·  ".join(augments) if augments else "-")
+        my_items = [self._resolve_entry(i, "item") for i in me.get("items", [])]
+        my_augments = [self._resolve_entry(a, "augment") for a in me.get("augments", [])]
+        self._detail_section_chips(box, "MY ITEMS", my_items)
+        self._detail_section_chips(box, "MY AUGMENTS", my_augments)
+
+        hint = tk.Label(box, text="LOBBY - click a player to see their build",
+                        bg=PANEL_BG, fg=TEXT_MUTED,
+                        font=("Segoe UI", 7, "bold"))
+        hint.pack(anchor="w", pady=(16, 2))
 
         table = tk.Frame(box, bg=PANEL_BG)
-        table.pack(fill="x", pady=(14, 0))
+        table.pack(fill="x")
         columns = ("#", "PLAYER", "CHAMPION", "K/D/A", "ELO", "RANK")
-        widths = (28, 190, 110, 70, 60, 50)
+        widths = (30, 200, 110, 70, 60, 52)
         for column, (title, width) in enumerate(zip(columns, widths)):
             table.grid_columnconfigure(column, minsize=width, weight=1 if column == 1 else 0)
             tk.Label(table, text=title, bg=PANEL_BG, fg=TEXT_MUTED,
                      font=("Segoe UI", 7, "bold"),
                      anchor="w").grid(row=0, column=column, sticky="ew")
-        for row_index, player in enumerate(players, start=1):
+
+        # Group duo partners together (Arena pairs share playerSubteamId).
+        def group_key(player):
+            subteam = player.get("subteam_id")
+            return (1, 0, player.get("participant_id") or 0) if not isinstance(subteam, int) \
+                else (0, subteam, player.get("participant_id") or 0)
+
+        ordered = sorted(players, key=group_key)
+        grid_row = 1
+        previous_subteam = None
+        team_ordinal = 0
+        for player in ordered:
+            subteam = player.get("subteam_id")
+            if len(ordered) > 2 and subteam != previous_subteam and any(
+                    p.get("subteam_id") is not None for p in players):
+                if subteam is not None or previous_subteam is not None:
+                    separator = tk.Frame(table, bg=PANEL_BORDER, height=1)
+                    separator.grid(row=grid_row, column=0, columnspan=len(columns),
+                                   sticky="ew", pady=(3, 1))
+                    grid_row += 1
+                    if subteam is not None:
+                        team_ordinal += 1
+                        tk.Label(table, text=f"TEAM {team_ordinal}", bg=PANEL_BG,
+                                 fg=TEXT_MUTED, font=("Segoe UI", 7, "bold"),
+                                 anchor="w").grid(row=grid_row, column=0,
+                                                  columnspan=len(columns), sticky="w")
+                        grid_row += 1
+            previous_subteam = subteam
+
             place_text = f"#{player['placement']}" if player.get("placement") else "-"
             place_color = WARNING if player.get("placement") == 1 else (
                 ACCENT_ALT if (player.get("placement") or 9) <= 3 else TEXT_PRIMARY)
-            tag_text = f"{player['name']}#{player['tag']}" if player.get("tag") else player.get("name", "-")
+            tag_text = (f"{player['name']}#{player['tag']}"
+                        if player.get("tag") else player.get("name", "-"))
             elo_var = tk.StringVar(value="...")
             rank_var = tk.StringVar(value="")
             self._elo_cell_vars[player.get("participant_id")] = (elo_var, rank_var)
@@ -3196,18 +3484,29 @@ class App:
                 (None, ACCENT_ALT),
                 (None, ACCENT_ALT),
             )
+            row_widgets = []
             for column, (text_value, color) in enumerate(cells):
                 if text_value is None:
                     variable = elo_var if column == 4 else rank_var
-                    tk.Label(table, textvariable=variable, bg=PANEL_BG, fg=color,
-                             font=("Segoe UI", 9)).grid(row=row_index, column=column,
-                                                        sticky="w")
+                    cell = tk.Label(table, textvariable=variable, bg=PANEL_BG,
+                                    fg=color, font=("Segoe UI", 9))
                 else:
-                    tk.Label(table, text=text_value, bg=PANEL_BG, fg=color,
-                             font=("Segoe UI", 9)).grid(row=row_index, column=column,
-                                                        sticky="w")
-            if player.get("win"):
-                pass  # win flag available per-player if needed later
+                    cell = tk.Label(table, text=text_value, bg=PANEL_BG, fg=color,
+                                    font=("Segoe UI", 9), cursor="hand2")
+                cell.grid(row=grid_row, column=column, sticky="w")
+                row_widgets.append(cell)
+
+            holder = tk.Frame(table, bg=PANEL_BG)
+            holder.grid(row=grid_row + 1, column=0, columnspan=len(columns), sticky="ew")
+
+            def toggle(_event, p=player, h=holder):
+                self._toggle_player_build(p, h)
+
+            for widget_cell in row_widgets:
+                widget_cell.bind("<Button-1>", toggle)
+            if player.get("participant_id") == me.get("participant_id"):
+                pass  # own row stays clickable too
+            grid_row += 2
         self._start_elo_lookup(players, token)
 
     def _detail_section(self, parent, title, content):
@@ -3219,8 +3518,51 @@ class App:
                  font=("Segoe UI", 9), justify="left", anchor="w",
                  wraplength=560).pack(fill="x", pady=(3, 0))
 
+    def _build_chips_into(self, parent, entries):
+        for entry in entries[:8]:
+            chip = tk.Frame(parent, bg=PANEL_ALT, highlightthickness=1,
+                            highlightbackground=PANEL_BORDER)
+            chip.pack(side="left", padx=(0, 5), pady=(2, 3))
+            label = tk.Label(chip, bg=PANEL_ALT, fg=TEXT_PRIMARY,
+                             font=("Segoe UI", 8), cursor="hand2")
+            label.pack(padx=4, pady=3)
+
+            def show(_event, name=entry["name"], widget=label):
+                self._show_tooltip(widget, name)
+
+            label.bind("<Enter>", show)
+            label.bind("<Leave>", self._hide_tooltip)
+
+            def apply_icon(photo, lbl=label, entry=entry):
+                try:
+                    if photo is not None:
+                        lbl.configure(image=photo, text="")
+                        lbl.image = photo
+                    else:
+                        short = entry.get("fallback") or entry["name"]
+                        lbl.configure(text=str(short)[:14])
+                except tk.TclError:
+                    pass  # widget already destroyed
+
+            self._icon_for(entry["url"], 22, apply_icon)
+
+    def _detail_section_chips(self, parent, title, entries):
+        frame = tk.Frame(parent, bg=PANEL_BG)
+        frame.pack(fill="x", pady=(12, 0))
+        tk.Label(frame, text=title, bg=PANEL_BG, fg=TEXT_MUTED,
+                 font=("Segoe UI", 7, "bold")).pack(anchor="w")
+        if entries:
+            row = tk.Frame(frame, bg=PANEL_BG)
+            row.pack(anchor="w")
+            self._build_chips_into(row, entries)
+        else:
+            tk.Label(frame, text="-", bg=PANEL_ALT, fg=TEXT_MUTED,
+                     font=("Segoe UI", 9)).pack(fill="x", pady=(3, 0))
+
     def _start_elo_lookup(self, players, token):
         region = (self.var_history_region.get() or "euw").strip().lower()
+        progress = {"done": 0, "errors": 0}
+        total = len(players)
 
         def apply(participant_id, result):
             if token != self._history_token or self._closing:
@@ -3232,6 +3574,7 @@ class App:
             if result == "error":
                 elo_var.set("err")
                 rank_var.set("")
+                progress["errors"] += 1
             elif result is None:
                 elo_var.set("-")
                 rank_var.set("")
@@ -3240,6 +3583,16 @@ class App:
                 elo_var.set(str(rating) if rating is not None else "-")
                 rank = result.get("rank")
                 rank_var.set(f"#{rank}" if isinstance(rank, int) else "")
+            if total:
+                progress["done"] += 1
+                percent = int(100 * progress["done"] / total)
+                suffix = f" ({progress['errors']} errors)" if progress["errors"] else ""
+                if progress["done"] >= total:
+                    self._set_history_status(
+                        f"Ratings loaded {progress['done']}/{total} (100%){suffix}")
+                else:
+                    self._set_history_status(
+                        f"Loading ratings... {percent}% ({progress['done']}/{total})")
 
         def worker():
             for player in players:

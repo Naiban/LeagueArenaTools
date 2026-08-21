@@ -3,9 +3,12 @@
 ## 1.02
 
 - Added a Match History tab listing the last 50 games.
-- Match details show items, augments, placements and KDA for every player.
-- Lobby ratings (ELO and rank) are fetched from the public arenasweats.lol API
-  with an in-app cache and selectable region.
+- Match details show items, augments, duo placements and KDA for every player.
+- Item and augment icons resolve through CommunityDragon with hover tooltips.
+- Every player's full build is one click away inside the lobby table.
+- Lobby ratings (ELO and rank) come from the public arenasweats.lol API using
+  an in-app cache; the region is detected from the connected League client.
+- Loading progress is reported while ratings are fetched.
 
 ## 1.01
 
