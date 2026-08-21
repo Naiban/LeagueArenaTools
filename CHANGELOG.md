@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.02
+
+- Added a Match History tab listing the last 50 games.
+- Match details show items, augments, placements and KDA for every player.
+- Lobby ratings (ELO and rank) are fetched from the public arenasweats.lol API
+  with an in-app cache and selectable region.
+
 ## 1.01
 
 - Added automatic update checks through GitHub Releases.

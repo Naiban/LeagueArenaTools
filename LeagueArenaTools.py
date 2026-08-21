@@ -3,6 +3,7 @@ import re
 import sys
 import json
 import copy
+import time
 import random
 import base64
 import secrets
@@ -30,7 +31,7 @@ try:
 except ImportError:
     websocket = None
 
-__version__ = "1.01"
+__version__ = "1.02"
 APP_TITLE = "LeagueArenaTools"
 WEBSOCKET_RECONNECT_DELAY = 0.25
 BRAVERY_LABEL = "Bravery"
@@ -187,6 +188,7 @@ DEFAULT_CONFIG = {
     "lobby_message_text": "",
     "custom_status_text": "",
     "auto_requeue_enabled": False,
+    "arenasweats_region": "euw",
     "minimize_to_tray": True,
     "auto_update_enabled": True,
 }
@@ -386,6 +388,17 @@ def _normalize(text: str) -> str:
 
 NTFY_BASE_URL = "https://ntfy.sh"
 LIVE_CLIENT_STATS_URL = "https://127.0.0.1:2999/liveclientdata/gamestats"
+
+ARENASWEATS_BASE_URL = "https://arenasweats.lol"
+ARENASWEATS_REGIONS = (
+    "euw", "na", "eune", "kr", "jp", "br", "las", "lan",
+    "oce", "tr", "ru", "sea", "tw", "vn", "me",
+)
+QUEUE_LABELS = {
+    1700: "Arena", 1090: "Ranked Arena",
+    420: "Ranked Solo/Duo", 440: "Ranked Flex",
+    400: "Draft Pick", 430: "Blind Pick", 450: "ARAM",
+}
 
 
 def generate_push_topic():
@@ -1554,6 +1567,171 @@ class LeagueArenaToolsBot:
 
 
 # =============================================================================
+# 3b) MATCH HISTORY PARSING - tolerant helpers for LCU match-history payloads
+#     and the public arenasweats.lol rating lookup.
+# =============================================================================
+
+def _first_text(*values):
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _identity_name(player):
+    if not isinstance(player, dict):
+        return ""
+    return _first_text(player.get("gameName"), player.get("riotIdGameName"),
+                       player.get("summonerName"), player.get("displayName"))
+
+
+def _identity_tag(player):
+    if not isinstance(player, dict):
+        return ""
+    return _first_text(player.get("tagLine"), player.get("riotIdTagline")).upper()
+
+
+def _walk_nodes(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_nodes(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_nodes(child)
+
+
+def find_placement(participant):
+    for node in _walk_nodes(participant):
+        for key in ("placement", "finalPlacement", "placing"):
+            value = node.get(key)
+            if isinstance(value, int) and 0 < value <= 20:
+                return value
+    return None
+
+
+def prettify_augment(raw):
+    if isinstance(raw, bool) or raw is None:
+        return ""
+    if isinstance(raw, int):
+        return f"Augment {raw}"
+    text = str(raw).replace("\\", "/").split("/")[-1]
+    lowered = text.lower()
+    for prefix in ("arenaaugment", "augment_", "augment"):
+        if lowered.startswith(prefix):
+            text = text[len(prefix):]
+            lowered = text.lower()
+    text = text.replace("_", " ").replace("-", " ").strip()
+    return text or str(raw)
+
+
+def collect_augments(participant):
+    found = []
+    seen = set()
+    for node in _walk_nodes(participant):
+        for key, value in node.items():
+            if "augment" not in key.lower():
+                continue
+            candidates = value if isinstance(value, (list, tuple)) else [value]
+            for raw in candidates:
+                if isinstance(raw, bool):
+                    continue
+                if not isinstance(raw, (int, str)):
+                    continue
+                marker = (type(raw).__name__, raw)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                found.append(prettify_augment(raw))
+    return [text for text in found if text][:8]
+
+
+def parse_history_games(payload):
+    games = ((payload or {}).get("games") or {}).get("games")
+    return [game for game in (games or []) if isinstance(game, dict)]
+
+
+def _stats_int(stats, *keys, default=None):
+    if not isinstance(stats, dict):
+        return default
+    for key in keys:
+        value = stats.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
+    return default
+
+
+def participant_items(stats):
+    items = []
+    for slot in range(7):
+        value = stats.get(f"item{slot}")
+        if isinstance(value, int) and value > 0:
+            items.append(value)
+    return items
+
+
+def summarize_history_game(game):
+    participants = game.get("participants") or []
+    me = participants[0] if isinstance(participants[0] if participants else None, dict) else {}
+    stats = me.get("stats") or {}
+    kills = _stats_int(stats, "kills", default=0)
+    deaths = _stats_int(stats, "deaths", default=0)
+    assists = _stats_int(stats, "assists", default=0)
+    win = stats.get("win")
+    return {
+        "game_id": game.get("gameId"),
+        "queue_id": game.get("queueId"),
+        "creation": game.get("gameCreation"),
+        "duration_s": game.get("gameDuration"),
+        "champion_id": me.get("championId"),
+        "placement": find_placement(me),
+        "win": bool(win) if isinstance(win, (bool, int)) else None,
+        "kda": f"{kills}/{deaths}/{assists}",
+    }
+
+
+def parse_match_detail(payload):
+    """Normalize an LCU match-detail payload into a simple view model."""
+    if not isinstance(payload, dict):
+        return None
+    identities = {}
+    for entry in payload.get("participantIdentities") or []:
+        if isinstance(entry, dict) and isinstance(entry.get("player"), dict):
+            identities[entry.get("participantId")] = entry["player"]
+    players = []
+    for part in payload.get("participants") or []:
+        if not isinstance(part, dict):
+            continue
+        stats = part.get("stats") or {}
+        player = identities.get(part.get("participantId"), {})
+        players.append({
+            "participant_id": part.get("participantId"),
+            "name": _identity_name(player),
+            "tag": _identity_tag(player),
+            "account_id": player.get("currentAccountId", player.get("accountId")),
+            "puuid": player.get("puuid"),
+            "champion_id": part.get("championId"),
+            "placement": find_placement(part),
+            "win": bool(stats["win"]) if isinstance(stats.get("win"), (bool, int)) else None,
+            "kills": _stats_int(stats, "kills", default=0),
+            "deaths": _stats_int(stats, "deaths", default=0),
+            "assists": _stats_int(stats, "assists", default=0),
+            "damage": _stats_int(stats, "totalDamageDealtToChampions"),
+            "gold": _stats_int(stats, "goldEarned"),
+            "items": participant_items(stats),
+            "augments": collect_augments(part),
+        })
+    return {
+        "game_id": payload.get("gameId"),
+        "queue_id": payload.get("queueId"),
+        "creation": payload.get("gameCreation"),
+        "duration_s": payload.get("gameDuration"),
+        "players": players,
+        "me": players[0] if players else {},
+    }
+
+
+# =============================================================================
 # 4) FUTURISTIC MINIMAL STYLE - dark theme, purple-cyan accent
 # =============================================================================
 
@@ -2241,6 +2419,7 @@ class App:
         "automation": ("Automation", "Matchmaking, lobby and background behavior"),
         "status": ("Custom Status", "Set the status shown in the League client"),
         "notifications": ("Notifications", "Private phone alerts delivered through ntfy"),
+        "history": ("Match History", "Last 50 games with items, augments and lobby ratings"),
         "activity": ("Activity", "Runtime events and diagnostics"),
     }
 
@@ -2261,6 +2440,16 @@ class App:
         self._update_check_running = False
         self._update_installing = False
         self._available_update = None
+
+        # Match History tab state.
+        self.history_status_var = tk.StringVar(value="Not loaded")
+        self._history_loading = False
+        self._match_summaries = []
+        self._detail_cache = {}
+        self._elo_cache = {}
+        self._history_items_map = None
+        self._history_token = 0
+        self._elo_cell_vars = {}
 
         root.title(f"{APP_TITLE} v{__version__}")
         root.geometry(f"{WIN_W}x{WIN_H}")
@@ -2309,6 +2498,8 @@ class App:
         self.var_minimize_to_tray = tk.BooleanVar(value=cfg.get("minimize_to_tray", True))
         self.var_auto_update = tk.BooleanVar(value=cfg.get("auto_update_enabled", True))
         self.var_delay_ms = tk.IntVar(value=int(cfg.get("delay_ms", 500)))
+        self.var_history_region = tk.StringVar(
+            value=str(cfg.get("arenasweats_region") or "euw"))
 
         self.session_stats = dict(DEFAULT_STATS)
         self.stat_total_vars = {key: tk.StringVar(value="0") for key, _ in STAT_ITEMS}
@@ -2334,6 +2525,7 @@ class App:
             ("minimize_to_tray", self.var_minimize_to_tray, self._bind_bool),
             ("auto_update_enabled", self.var_auto_update, self._bind_bool),
             ("delay_ms", self.var_delay_ms, self._bind_int),
+            ("arenasweats_region", self.var_history_region, self._bind_str),
         )
         for key, variable, binder in bindings:
             binder(key, variable)
@@ -2388,7 +2580,7 @@ class App:
         for key, label in (
             ("dashboard", "  Dashboard"), ("champions", "  Champions"),
             ("automation", "  Automation"), ("status", "  Custom Status"),
-            ("notifications", "  Notifications"),
+            ("notifications", "  Notifications"), ("history", "  History"),
             ("activity", "  Activity"),
         ):
             button = tk.Button(
@@ -2454,6 +2646,7 @@ class App:
         self._build_automation(self.page_frames["automation"])
         self._build_status(self.page_frames["status"])
         self._build_notifications(self.page_frames["notifications"])
+        self._build_history(self.page_frames["history"])
         self._build_activity(self.page_frames["activity"])
 
     def _build_dashboard(self, page):
@@ -2712,6 +2905,378 @@ class App:
         MiniButton(controls, "Set status", width=10,
                    command=self._apply_custom_status).pack(side="right")
         self._sync_custom_status_draft()
+
+    def _build_history(self, page):
+        toolbar = tk.Frame(page, bg=BG)
+        toolbar.pack(fill="x", pady=(0, 8))
+        MiniButton(toolbar, "Refresh", width=8, command=self._load_history).pack(side="left")
+        tk.Label(toolbar, text="RATINGS REGION", bg=BG, fg=TEXT_MUTED,
+                 font=("Segoe UI", 8, "bold")).pack(side="left", padx=(16, 6))
+        region_menu = tk.OptionMenu(toolbar, self.var_history_region, *ARENASWEATS_REGIONS)
+        region_menu.configure(
+            bg=FIELD_BG, fg=TEXT_PRIMARY, activebackground=PANEL_ALT,
+            activeforeground=TEXT_PRIMARY, relief="flat", bd=0,
+            highlightthickness=1, highlightbackground=PANEL_BORDER,
+            font=("Segoe UI", 8))
+        region_dropdown = region_menu.nametowidget(region_menu["menu"])
+        region_dropdown.configure(bg=FIELD_BG, fg=TEXT_PRIMARY,
+                                  activebackground=ACCENT,
+                                  activeforeground="#ffffff", font=("Segoe UI", 8))
+        region_menu.pack(side="left")
+        tk.Label(toolbar, textvariable=self.history_status_var, bg=BG, fg=TEXT_MUTED,
+                 font=("Segoe UI", 9)).pack(side="right")
+
+        body = tk.Frame(page, bg=BG)
+        body.pack(fill="both", expand=True)
+        body.grid_columnconfigure(0, weight=0)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        left = tk.Frame(body, bg=BG)
+        left.grid(row=0, column=0, sticky="nsw")
+        tk.Label(left, text="RECENT GAMES", bg=BG, fg=TEXT_MUTED,
+                 font=("Segoe UI", 7, "bold")).pack(anchor="w", pady=(0, 4))
+        list_wrap = tk.Frame(left, bg=PANEL_BORDER)
+        list_wrap.pack(fill="both", expand=True)
+        self.history_list = tk.Listbox(
+            list_wrap, width=48, exportselection=False, activestyle="none",
+            font=("Cascadia Mono", 9), bg=FIELD_BG, fg=TEXT_PRIMARY,
+            selectbackground=ACCENT, selectforeground="#ffffff",
+            relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=PANEL_BORDER, highlightcolor=ACCENT)
+        history_scroll = tk.Scrollbar(list_wrap, orient="vertical",
+                                      command=self.history_list.yview)
+        self.history_list.configure(yscrollcommand=history_scroll.set)
+        self.history_list.pack(side="left", fill="both", expand=True)
+        history_scroll.pack(side="right", fill="y")
+        self.history_list.bind("<<ListboxSelect>>", self._on_history_select)
+
+        right = tk.Frame(body, bg=BG)
+        right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        tk.Label(right, text="GAME DETAILS", bg=BG, fg=TEXT_MUTED,
+                 font=("Segoe UI", 7, "bold")).pack(anchor="w", pady=(0, 4))
+        detail_wrap = tk.Frame(right, bg=PANEL_BORDER)
+        detail_wrap.pack(fill="both", expand=True)
+        canvas = tk.Canvas(detail_wrap, bg=PANEL_BG, highlightthickness=0)
+        detail_scroll = tk.Scrollbar(detail_wrap, orient="vertical",
+                                     command=canvas.yview)
+        self.history_detail_inner = tk.Frame(canvas, bg=PANEL_BG)
+        self.history_detail_inner.bind(
+            "<Configure>",
+            lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.history_detail_inner, anchor="nw")
+        canvas.configure(yscrollcommand=detail_scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        detail_scroll.pack(side="right", fill="y")
+        # Wheel scrolling only while the pointer hovers the details panel.
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all(
+            "<MouseWheel>",
+            lambda ev: canvas.yview_scroll(int(-ev.delta / 120), "units")))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        tk.Label(self.history_detail_inner,
+                 text="Select a game to see items,\naugments and lobby ratings.",
+                 bg=PANEL_BG, fg=TEXT_MUTED, font=("Segoe UI", 10),
+                 justify="center").pack(padx=24, pady=48)
+
+    def _run_on_ui(self, function):
+        """Marshal a callable onto the Tk thread; safe from any worker thread."""
+        try:
+            self.root.after(0, function)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _set_history_status(self, text):
+        if not self._closing:
+            self.history_status_var.set(text)
+
+    def _load_history(self):
+        if self._closing or self._history_loading:
+            return
+        if not self.client.is_connected or self._connection_state is not True:
+            try:
+                self.client.connect()
+            except Exception:
+                self._set_history_status("League client is offline")
+                self.log("History: League client is not connected.")
+                return
+        self._history_loading = True
+        self._set_history_status("Loading recent games...")
+
+        def worker():
+            items = {}
+            try:
+                response = self.client.get("/lol-game-data/items.json")
+                if response.status_code == 200:
+                    for item in response.json():
+                        item_id, name = item.get("id"), item.get("name")
+                        if isinstance(item_id, int) and isinstance(name, str) and name:
+                            items[item_id] = name
+            except Exception:
+                pass
+            games, error = [], None
+            try:
+                response = self.client.get(
+                    "/lol-match-history/v1/products/lol/current-summoner/matches"
+                    "?begIndex=0&endIndex=49")
+                if response.status_code == 200:
+                    games = parse_history_games(response.json())
+                else:
+                    error = f"HTTP {response.status_code}"
+            except Exception as exc:
+                error = str(exc)
+            summaries = [summarize_history_game(game) for game in games]
+
+            def finish():
+                if self._closing:
+                    return
+                self._history_loading = False
+                if items:
+                    self._history_items_map = items
+                self._fill_history_list(summaries, error)
+
+            self._run_on_ui(finish)
+
+        threading.Thread(target=worker, daemon=True, name="LAT-HistoryList").start()
+
+    def _fill_history_list(self, summaries, error=None):
+        self._match_summaries = summaries
+        self.history_list.delete(0, tk.END)
+        if error:
+            self._set_history_status(f"Failed to load ({error})")
+            self.log(f"History: request failed ({error}).")
+            return
+        for summary in summaries:
+            self.history_list.insert(tk.END, self._format_history_row(summary))
+        count = len(summaries)
+        self._set_history_status(f"{count} games loaded" if count else "No games found")
+        if count:
+            self.log(f"History: loaded {count} recent games.")
+
+    def _format_history_row(self, summary):
+        champ = self.champion_data.label(summary.get("champion_id") or 0)
+        place = f"#{summary['placement']}" if summary.get("placement") else "--"
+        result = "?" if summary.get("win") is None else ("W" if summary["win"] else "L")
+        creation = summary.get("creation") or 0
+        when = time.strftime("%m-%d %H:%M", time.localtime(creation / 1000)) if creation else ""
+        minutes = max(1, round((summary.get("duration_s") or 0) / 60))
+        queue_label = QUEUE_LABELS.get(summary.get("queue_id"), "")
+        row = f"{place:<3}{champ[:15]:<15}{summary.get('kda', ''):<9}{result} {minutes:>2}m {queue_label[:12]}"
+        return row.ljust(len(row) + max(0, 46 - len(row))) + ("  " + when if when else "")
+
+    def _on_history_select(self, _event=None):
+        selection = self.history_list.curselection()
+        if not selection or self._closing:
+            return
+        index = selection[0]
+        if index >= len(self._match_summaries):
+            return
+        game_id = self._match_summaries[index].get("game_id")
+        if game_id is None:
+            return
+        cached = self._detail_cache.get(game_id)
+        if cached is not None:
+            self._render_history_detail(cached)
+            return
+        if not self.client.is_connected:
+            self._set_history_status("League client is offline")
+            return
+        self._set_history_status("Loading match details...")
+
+        def worker():
+            payload, error = None, None
+            try:
+                response = self.client.get(f"/lol-match-history/v1/games/{game_id}")
+                if response.status_code == 200:
+                    payload = response.json()
+                else:
+                    error = f"HTTP {response.status_code}"
+            except Exception as exc:
+                error = str(exc)
+            view = parse_match_detail(payload)
+
+            def finish():
+                if self._closing:
+                    return
+                if view is None:
+                    self._set_history_status(f"Details failed ({error})")
+                    return
+                self._detail_cache[game_id] = view
+                self._render_history_detail(view)
+
+            self._run_on_ui(finish)
+
+        threading.Thread(target=worker, daemon=True, name="LAT-HistoryDetail").start()
+
+    def _render_history_detail(self, view):
+        host = self.history_detail_inner
+        for child in host.winfo_children():
+            child.destroy()
+        self._elo_cell_vars = {}
+        self._history_token += 1
+        token = self._history_token
+
+        players = view.get("players") or []
+        me = view.get("me") or {}
+        box = tk.Frame(host, bg=PANEL_BG)
+        box.pack(fill="both", expand=True, padx=16, pady=14)
+
+        header = tk.Frame(box, bg=PANEL_BG)
+        header.pack(fill="x")
+        champ_name = self.champion_data.label(me.get("champion_id") or 0)
+        tk.Label(header, text=champ_name, bg=PANEL_BG, fg=TEXT_PRIMARY,
+                 font=("Segoe UI", 17, "bold")).pack(side="left")
+        placement = me.get("placement")
+        if placement:
+            color = WARNING if placement == 1 else (
+                ACCENT_ALT if placement <= 3 else TEXT_MUTED)
+            tk.Label(header, text=f"#{placement}", bg=PANEL_BG, fg=color,
+                     font=("Segoe UI", 17, "bold")).pack(side="left", padx=(12, 0))
+        win = me.get("win")
+        if win is not None:
+            tk.Label(header, text="VICTORY" if win else "DEFEAT",
+                     bg=PANEL_BG, fg=SUCCESS if win else DANGER,
+                     font=("Segoe UI", 9, "bold")).pack(side="right")
+
+        meta_bits = []
+        queue_label = QUEUE_LABELS.get(view.get("queue_id"))
+        if queue_label:
+            meta_bits.append(queue_label)
+        duration = view.get("duration_s")
+        if isinstance(duration, (int, float)) and duration > 0:
+            meta_bits.append(f"{int(duration // 60)}m {int(duration % 60):02d}s")
+        creation = view.get("creation")
+        if creation:
+            meta_bits.append(time.strftime("%Y-%m-%d %H:%M", time.localtime(creation / 1000)))
+        if meta_bits:
+            tk.Label(header, text="   ".join(meta_bits), bg=PANEL_BG,
+                     fg=TEXT_MUTED, font=("Segoe UI", 9)).pack(anchor="w")
+
+        kda_line = f"{me.get('kills', 0)} / {me.get('deaths', 0)} / {me.get('assists', 0)} KDA"
+        extras = []
+        if me.get("damage"):
+            extras.append(f"{me['damage']:,} dmg".replace(",", " "))
+        if me.get("gold"):
+            extras.append(f"{me['gold']:,} gold".replace(",", " "))
+        if extras:
+            kda_line += "   ·   " + "   ".join(extras)
+        tk.Label(box, text=kda_line, bg=PANEL_BG, fg=TEXT_PRIMARY,
+                 font=("Segoe UI", 9)).pack(anchor="w", pady=(6, 0))
+
+        items_map = self._history_items_map or {}
+        item_names = [items_map.get(item_id, f"Item {item_id}")
+                      for item_id in me.get("items", [])]
+        self._detail_section(box, "ITEMS",
+                             " · ".join(item_names) if item_names else "-")
+        augments = me.get("augments") or []
+        self._detail_section(box, "AUGMENTS",
+                             "  ·  ".join(augments) if augments else "-")
+
+        table = tk.Frame(box, bg=PANEL_BG)
+        table.pack(fill="x", pady=(14, 0))
+        columns = ("#", "PLAYER", "CHAMPION", "K/D/A", "ELO", "RANK")
+        widths = (28, 190, 110, 70, 60, 50)
+        for column, (title, width) in enumerate(zip(columns, widths)):
+            table.grid_columnconfigure(column, minsize=width, weight=1 if column == 1 else 0)
+            tk.Label(table, text=title, bg=PANEL_BG, fg=TEXT_MUTED,
+                     font=("Segoe UI", 7, "bold"),
+                     anchor="w").grid(row=0, column=column, sticky="ew")
+        for row_index, player in enumerate(players, start=1):
+            place_text = f"#{player['placement']}" if player.get("placement") else "-"
+            place_color = WARNING if player.get("placement") == 1 else (
+                ACCENT_ALT if (player.get("placement") or 9) <= 3 else TEXT_PRIMARY)
+            tag_text = f"{player['name']}#{player['tag']}" if player.get("tag") else player.get("name", "-")
+            elo_var = tk.StringVar(value="...")
+            rank_var = tk.StringVar(value="")
+            self._elo_cell_vars[player.get("participant_id")] = (elo_var, rank_var)
+            cells = (
+                (place_text, place_color),
+                (tag_text or "-", TEXT_PRIMARY),
+                (self.champion_data.label(player.get("champion_id") or 0), TEXT_MUTED),
+                (f"{player.get('kills', 0)}/{player.get('deaths', 0)}/{player.get('assists', 0)}", TEXT_MUTED),
+                (None, ACCENT_ALT),
+                (None, ACCENT_ALT),
+            )
+            for column, (text_value, color) in enumerate(cells):
+                if text_value is None:
+                    variable = elo_var if column == 4 else rank_var
+                    tk.Label(table, textvariable=variable, bg=PANEL_BG, fg=color,
+                             font=("Segoe UI", 9)).grid(row=row_index, column=column,
+                                                        sticky="w")
+                else:
+                    tk.Label(table, text=text_value, bg=PANEL_BG, fg=color,
+                             font=("Segoe UI", 9)).grid(row=row_index, column=column,
+                                                        sticky="w")
+            if player.get("win"):
+                pass  # win flag available per-player if needed later
+        self._start_elo_lookup(players, token)
+
+    def _detail_section(self, parent, title, content):
+        frame = tk.Frame(parent, bg=PANEL_BG)
+        frame.pack(fill="x", pady=(12, 0))
+        tk.Label(frame, text=title, bg=PANEL_BG, fg=TEXT_MUTED,
+                 font=("Segoe UI", 7, "bold")).pack(anchor="w")
+        tk.Label(frame, text=content, bg=PANEL_ALT, fg=TEXT_PRIMARY,
+                 font=("Segoe UI", 9), justify="left", anchor="w",
+                 wraplength=560).pack(fill="x", pady=(3, 0))
+
+    def _start_elo_lookup(self, players, token):
+        region = (self.var_history_region.get() or "euw").strip().lower()
+
+        def apply(participant_id, result):
+            if token != self._history_token or self._closing:
+                return
+            cells = self._elo_cell_vars.get(participant_id)
+            if not cells:
+                return
+            elo_var, rank_var = cells
+            if result == "error":
+                elo_var.set("err")
+                rank_var.set("")
+            elif result is None:
+                elo_var.set("-")
+                rank_var.set("")
+            else:
+                rating = result.get("rating")
+                elo_var.set(str(rating) if rating is not None else "-")
+                rank = result.get("rank")
+                rank_var.set(f"#{rank}" if isinstance(rank, int) else "")
+
+        def worker():
+            for player in players:
+                if self._closing:
+                    return
+                key = ((player.get("name") or "").lower(),
+                       (player.get("tag") or "").lower(), region)
+                cached = self._elo_cache.get(key, "miss")
+                if cached == "miss":
+                    name, tag = player.get("name") or "", player.get("tag") or ""
+                    term = f"{name}#{tag}" if tag and tag != name else name
+                    if not name:
+                        cached = None
+                    else:
+                        try:
+                            response = requests.get(
+                                f"{ARENASWEATS_BASE_URL}/api/player_rank",
+                                params={"search_term": term, "region": region,
+                                        "season": "live"},
+                                headers={"User-Agent": APP_TITLE},
+                                timeout=(5, 10))
+                            if response.status_code == 200:
+                                data = response.json()
+                                cached = {"rating": data.get("rating"),
+                                          "rank": data.get("player_rank")}
+                            elif response.status_code == 404:
+                                cached = None
+                            else:
+                                cached = "error"
+                        except Exception:
+                            cached = "error"
+                        time.sleep(0.12)
+                    self._elo_cache[key] = cached
+                participant_id = player.get("participant_id")
+                self._run_on_ui(lambda pid=participant_id, res=cached: apply(pid, res))
+
+        threading.Thread(target=worker, daemon=True, name="LAT-EloLookup").start()
 
     def _build_activity(self, page):
         toolbar = tk.Frame(page, bg=BG)
@@ -3348,7 +3913,7 @@ class App:
             self.log_box.configure(state="disabled")
         try:
             self.root.after(0, write)
-        except tk.TclError:
+        except (tk.TclError, RuntimeError):
             pass
 
     def _poll_connection(self):
