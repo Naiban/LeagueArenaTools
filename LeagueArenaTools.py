@@ -189,6 +189,7 @@ DEFAULT_CONFIG = {
     "custom_status_text": "",
     "auto_requeue_enabled": False,
     "arenasweats_region": "euw",
+    "history_stat_column": "damage",
     "minimize_to_tray": True,
     "auto_update_enabled": True,
 }
@@ -410,11 +411,37 @@ QUEUE_LABELS = {
     400: "Draft Pick", 430: "Blind Pick", 450: "ARAM",
 }
 
+# Selectable lobby-table statistic (config: history_stat_column).
+HISTORY_STAT_COLUMNS = {
+    "damage": ("DAMAGE", "damage"),
+    "gold": ("GOLD", "gold"),
+    "heal": ("HEALING", "heal"),
+    "taken": ("TANKED", "taken"),
+    "level": ("LEVEL", "level"),
+}
 
-def cdragon_asset_url(icon_path):
-    """Map a game asset path to its raw.communitydragon.org URL."""
+_TAG_BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*/?>")
+_TEMPLATE_RE = re.compile(r"\{\{[^{}]*\}\}")
+
+
+def clean_game_text(text):
+    """Strip Riot markup so descriptions read naturally in a tooltip."""
+    if not isinstance(text, str):
+        return ""
+    text = _TEMPLATE_RE.sub("", text)
+    text = _TAG_BR_RE.sub("\n", text)
+    text = _TAG_RE.sub("", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    lines = [line.strip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line).strip()
+
+
+def cdragon_icon_candidates(icon_path):
+    """Ordered CDN URLs for a game asset (plugins tree + game tree)."""
     if not isinstance(icon_path, str) or not icon_path.strip():
-        return None
+        return []
     lowered = icon_path.replace("\\", "/").strip().lower()
     marker = "/lol-game-data/assets/"
     if marker in lowered:
@@ -422,8 +449,16 @@ def cdragon_asset_url(icon_path):
     else:
         rel = lowered.lstrip("/")
     if not rel:
-        return None
-    return f"{CDRAGON_BASE_URL}/plugins/rcp-be-lol-game-data/global/default/{rel}"
+        return []
+    base = CDRAGON_BASE_URL + "/plugins/rcp-be-lol-game-data/global/default/"
+    return [base + rel, CDRAGON_BASE_URL + "/game/" + rel]
+
+
+def _first_text(*values):
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 
 def generate_push_topic():
@@ -1780,6 +1815,9 @@ def parse_match_detail(payload):
             "assists": _stats_int(stats, "assists", default=0),
             "damage": _stats_int(stats, "totalDamageDealtToChampions"),
             "gold": _stats_int(stats, "goldEarned"),
+            "heal": _stats_int(stats, "totalHeal"),
+            "taken": _stats_int(stats, "totalDamageTaken"),
+            "level": _stats_int(stats, "champLevel"),
             "items": participant_items(stats),
             "augments": collect_augments(part),
         })
@@ -2509,8 +2547,8 @@ class App:
         self._match_summaries = []
         self._detail_cache = {}
         self._elo_cache = {}
-        self._history_items_map = {}      # item id -> {"name", "icon_url"}
-        self._history_augments_map = {}   # augment id -> {"name", "icon_url"}
+        self._history_items_map = {}      # item id -> {"name", "icon_urls", "tooltip"}
+        self._history_augments_map = {}   # augment id -> {"name", "icon_urls", "tooltip"}
         self._history_meta_loaded = False
         self._history_loading_meta = False
         self._icon_photo_cache = {}       # (url, size) -> PhotoImage | None
@@ -2569,6 +2607,8 @@ class App:
         self.var_delay_ms = tk.IntVar(value=int(cfg.get("delay_ms", 500)))
         self.var_history_region = tk.StringVar(
             value=str(cfg.get("arenasweats_region") or "euw"))
+        self.var_history_stat = tk.StringVar(
+            value=str(cfg.get("history_stat_column") or "damage"))
 
         self.session_stats = dict(DEFAULT_STATS)
         self.stat_total_vars = {key: tk.StringVar(value="0") for key, _ in STAT_ITEMS}
@@ -2595,6 +2635,7 @@ class App:
             ("auto_update_enabled", self.var_auto_update, self._bind_bool),
             ("delay_ms", self.var_delay_ms, self._bind_int),
             ("arenasweats_region", self.var_history_region, self._bind_str),
+            ("history_stat_column", self.var_history_stat, self._bind_str),
         )
         for key, variable, binder in bindings:
             binder(key, variable)
@@ -2992,8 +3033,39 @@ class App:
                                   activebackground=ACCENT,
                                   activeforeground="#ffffff", font=("Segoe UI", 8))
         region_menu.pack(side="left")
+        tk.Label(toolbar, text="STAT COLUMN", bg=BG, fg=TEXT_MUTED,
+                 font=("Segoe UI", 8, "bold")).pack(side="left", padx=(14, 6))
+        stat_menu = tk.OptionMenu(toolbar, self.var_history_stat,
+                                  *HISTORY_STAT_COLUMNS.keys())
+        stat_menu.configure(
+            bg=FIELD_BG, fg=TEXT_PRIMARY, activebackground=PANEL_ALT,
+            activeforeground=TEXT_PRIMARY, relief="flat", bd=0,
+            highlightthickness=1, highlightbackground=PANEL_BORDER,
+            font=("Segoe UI", 8))
+        stat_dropdown = stat_menu.nametowidget(stat_menu["menu"])
+        stat_dropdown.configure(bg=FIELD_BG, fg=TEXT_PRIMARY,
+                                activebackground=ACCENT,
+                                activeforeground="#ffffff", font=("Segoe UI", 8))
+        stat_menu.pack(side="left")
+        self.var_history_stat.trace_add("write", self._on_stat_column_change)
         tk.Label(toolbar, textvariable=self.history_status_var, bg=BG, fg=TEXT_MUTED,
                  font=("Segoe UI", 9)).pack(side="right")
+
+        # Wheel scrolling anywhere over the details panel.
+        def route_wheel(event):
+            try:
+                under = self.root.winfo_containing(event.x_root, event.y_root)
+            except Exception:
+                return
+            widget = under
+            while widget is not None:
+                if widget is self.history_detail_canvas:
+                    self.history_detail_canvas.yview_scroll(
+                        int(-event.delta / 120), "units")
+                    return
+                widget = getattr(widget, "master", None)
+
+        self.root.bind_all("<MouseWheel>", route_wheel, add="+")
 
         body = tk.Frame(page, bg=BG)
         body.pack(fill="both", expand=True)
@@ -3037,11 +3109,6 @@ class App:
         canvas.configure(yscrollcommand=detail_scroll.set)
         canvas.pack(side="left", fill="both", expand=True)
         detail_scroll.pack(side="right", fill="y")
-        # Wheel scrolling only while the pointer hovers the details panel.
-        canvas.bind("<Enter>", lambda _e: canvas.bind_all(
-            "<MouseWheel>",
-            lambda ev: canvas.yview_scroll(int(-ev.delta / 120), "units")))
-        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
         tk.Label(self.history_detail_inner,
                  text="Select a game to see items,\naugments and lobby ratings.",
                  bg=PANEL_BG, fg=TEXT_MUTED, font=("Segoe UI", 10),
@@ -3104,9 +3171,13 @@ class App:
                     for entry in response.json():
                         item_id, name = entry.get("id"), entry.get("name")
                         if isinstance(item_id, int) and isinstance(name, str) and name:
+                            tooltip = clean_game_text(entry.get("plaintext")
+                                                      or entry.get("description"))
                             items[item_id] = {
                                 "name": name,
-                                "icon_url": cdragon_asset_url(entry.get("iconPath")),
+                                "icon_urls": cdragon_icon_candidates(
+                                    entry.get("iconPath")),
+                                "tooltip": tooltip,
                             }
             except Exception:
                 pass
@@ -3119,7 +3190,8 @@ class App:
                             icon = entry.get("iconLarge") or entry.get("iconSmall") or ""
                             augments[aug_id] = {
                                 "name": name,
-                                "icon_url": cdragon_asset_url(icon),
+                                "icon_urls": cdragon_icon_candidates(icon),
+                                "tooltip": clean_game_text(entry.get("desc")),
                             }
             except Exception:
                 pass
@@ -3249,23 +3321,30 @@ class App:
         threading.Thread(target=worker, daemon=True, name="LAT-HistoryDetail").start()
 
     def _resolve_entry(self, entry_id, kind):
-        """entry id -> display dict {"name", "url", "fallback"}."""
+        """entry id -> {"name", "urls", "tooltip", "fallback"}."""
         mapping = (self._history_items_map if kind == "item"
                    else self._history_augments_map)
         info = mapping.get(entry_id)
         if isinstance(info, dict):
-            return {"name": info.get("name") or str(entry_id),
-                    "url": info.get("icon_url"), "fallback": None}
+            return {
+                "name": info.get("name") or str(entry_id),
+                "urls": info.get("icon_urls") or [],
+                "tooltip": info.get("tooltip") or "",
+                "fallback": None,
+            }
         prefix = "Item" if kind == "item" else "Augment"
-        return {"name": f"{prefix} {entry_id}", "url": None,
+        return {"name": f"{prefix} {entry_id}", "urls": [], "tooltip": "",
                 "fallback": f"{prefix[0]}{entry_id}"}
 
-    def _icon_for(self, url, size, callback):
-        """Fetch an icon asynchronously; callback(photo|None) runs on the UI thread."""
-        if not url:
+    def _icon_for(self, urls, size, callback):
+        """Fetch an icon trying each candidate URL; callback(photo|None) on UI thread."""
+        if isinstance(urls, str):
+            urls = [urls]
+        urls = [u for u in (urls or []) if u]
+        if not urls:
             self._run_on_ui(lambda: callback(None))
             return
-        key = (url, size)
+        key = (urls[0], size)
         if key in self._icon_photo_cache:
             photo = self._icon_photo_cache[key]
 
@@ -3276,13 +3355,17 @@ class App:
 
         def worker():
             pil_image = None
-            try:
-                import io
-                from PIL import Image as PILImage
-                data = requests.get(url, timeout=(5, 15)).content
-                pil_image = PILImage.open(io.BytesIO(data)).convert("RGBA")
-                pil_image.thumbnail((size * 2, size * 2))
-            except Exception:
+            import io
+            from PIL import Image as PILImage
+            for candidate in urls:
+                try:
+                    data = requests.get(candidate, timeout=(5, 15)).content
+                    pil_image = PILImage.open(io.BytesIO(data)).convert("RGBA")
+                    pil_image.thumbnail((size * 2, size * 2))
+                    break
+                except Exception:
+                    continue
+            else:
                 pil_image = None
 
             def make():
@@ -3310,7 +3393,7 @@ class App:
             tip.wm_geometry(f"+{x}+{y}")
             tk.Label(tip, text=text, bg="#1c2438", fg=TEXT_PRIMARY,
                      relief="solid", bd=1, font=("Segoe UI", 9),
-                     justify="left").pack(ipadx=6, ipady=3)
+                     justify="left", wraplength=420).pack(ipadx=8, ipady=5)
             self._tooltip = tip
         except Exception:
             self._tooltip = None
@@ -3362,6 +3445,13 @@ class App:
             augments_row = tk.Frame(inner, bg="#0e1422")
             augments_row.pack(anchor="w")
             self._build_chips_into(augments_row, augments)
+
+    def _on_stat_column_change(self, *_args):
+        if self._current_detail_view is not None and not self._closing:
+            try:
+                self._render_history_detail(self._current_detail_view)
+            except tk.TclError:
+                pass
 
     def _render_history_detail(self, view):
         host = self.history_detail_inner
@@ -3430,10 +3520,16 @@ class App:
                         font=("Segoe UI", 7, "bold"))
         hint.pack(anchor="w", pady=(16, 2))
 
+        stat_key = self.var_history_stat.get() if hasattr(self, "var_history_stat") else "damage"
+        if stat_key not in HISTORY_STAT_COLUMNS:
+            stat_key = "damage"
+        column_title, column_field = HISTORY_STAT_COLUMNS[stat_key]
+
         table = tk.Frame(box, bg=PANEL_BG)
         table.pack(fill="x")
-        columns = ("#", "PLAYER", "CHAMPION", "K/D/A", "ELO", "RANK")
-        widths = (30, 200, 110, 70, 60, 52)
+        columns = ("#", "PLAYER", "CHAMPION", "K/D/A",
+                   column_title, "ELO", "RANK")
+        widths = (30, 200, 110, 70, 80, 60, 52)
         for column, (title, width) in enumerate(zip(columns, widths)):
             table.grid_columnconfigure(column, minsize=width, weight=1 if column == 1 else 0)
             tk.Label(table, text=title, bg=PANEL_BG, fg=TEXT_MUTED,
@@ -3476,18 +3572,24 @@ class App:
             elo_var = tk.StringVar(value="...")
             rank_var = tk.StringVar(value="")
             self._elo_cell_vars[player.get("participant_id")] = (elo_var, rank_var)
+            stat_value = player.get(column_field)
+            if stat_key == "level":
+                stat_text = str(stat_value) if stat_value else "-"
+            else:
+                stat_text = f"{stat_value:,}".replace(",", " ") if stat_value else "-"
             cells = (
                 (place_text, place_color),
                 (tag_text or "-", TEXT_PRIMARY),
                 (self.champion_data.label(player.get("champion_id") or 0), TEXT_MUTED),
                 (f"{player.get('kills', 0)}/{player.get('deaths', 0)}/{player.get('assists', 0)}", TEXT_MUTED),
+                (stat_text, TEXT_PRIMARY),
                 (None, ACCENT_ALT),
                 (None, ACCENT_ALT),
             )
             row_widgets = []
             for column, (text_value, color) in enumerate(cells):
                 if text_value is None:
-                    variable = elo_var if column == 4 else rank_var
+                    variable = elo_var if column == 5 else rank_var
                     cell = tk.Label(table, textvariable=variable, bg=PANEL_BG,
                                     fg=color, font=("Segoe UI", 9))
                 else:
@@ -3527,8 +3629,11 @@ class App:
                              font=("Segoe UI", 8), cursor="hand2")
             label.pack(padx=4, pady=3)
 
-            def show(_event, name=entry["name"], widget=label):
-                self._show_tooltip(widget, name)
+            def show(_event, entry=entry, widget=label):
+                tooltip_text = entry.get("tooltip") or ""
+                text = (f"{entry['name']}\n\n{tooltip_text}" if tooltip_text
+                        else entry["name"])
+                self._show_tooltip(widget, text)
 
             label.bind("<Enter>", show)
             label.bind("<Leave>", self._hide_tooltip)
@@ -3544,7 +3649,7 @@ class App:
                 except tk.TclError:
                     pass  # widget already destroyed
 
-            self._icon_for(entry["url"], 22, apply_icon)
+            self._icon_for(entry.get("urls"), 22, apply_icon)
 
     def _detail_section_chips(self, parent, title, entries):
         frame = tk.Frame(parent, bg=PANEL_BG)
