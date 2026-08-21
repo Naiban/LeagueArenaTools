@@ -441,6 +441,83 @@ def clean_game_text(text):
     return "\n".join(line for line in lines if line).strip()
 
 
+_KNOWN_STAT_TOKENS = {
+    "AP": "AP", "AD": "AD", "Health": "HP", "Armor": "Armor",
+    "MagicResist": "MR", "AttackSpeed": "Attack Speed",
+    "MoveSpeed": "Move Speed", "AbilityHaste": "Haste",
+    "AbilityPower": "AP", "Lifesteal": "Lifesteal", "OmniVamp": "Omni Vamp",
+    "Mana": "Mana", "Energy": "Energy", "CritChance": "Crit Chance",
+}
+
+
+def expand_augment_description(text, data_values):
+    """Replace scaling placeholders with per-level numbers from dataValues."""
+    if not isinstance(text, str):
+        return ""
+    values = data_values if isinstance(data_values, dict) else {}
+
+    def format_number(raw):
+        try:
+            number = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if abs(number) < 1:
+            return f"{int(round(number * 100))}%"
+        if number.is_integer():
+            return str(int(number))
+        return f"{number:.2f}".rstrip("0").rstrip(".")
+
+    def replace_scaled(match):
+        key = match.group(1)
+        entries = values.get(key)
+        if not isinstance(entries, list) or not entries:
+            return ""
+        numbers = []
+        for entry in entries:
+            formatted = format_number(entry)
+            if formatted is not None:
+                numbers.append(formatted)
+        deduped = [n for i, n in enumerate(numbers)
+                   if i == 0 or n != numbers[i - 1]]
+        if not deduped:
+            return ""
+        result = "/".join(deduped)
+        if len(entries) > 1:
+            result += f" ({len(entries)} levels)"
+        return result
+
+    def replace_token(match):
+        token = match.group(1)
+        return _KNOWN_STAT_TOKENS.get(
+            token, re.sub(r"(?<=[a-z])(?=[A-Z])", " ", token))
+
+    text = re.sub(r"%:([A-Za-z0-9_]+)%", replace_scaled, text)
+    text = re.sub(r"@([A-Za-z]+)@", replace_token, text)
+    return text
+
+
+def select_local_player(players, account_ids=frozenset(), puuid=""):
+    """Pick the local player from a parsed match; falls back to first row."""
+    if account_ids:
+        for player in players:
+            if player.get("account_id") in account_ids:
+                return player
+    if puuid:
+        for player in players:
+            if player.get("puuid") == puuid:
+                return player
+    return players[0] if players else {}
+
+
+def sort_history_summaries(summaries):
+    """Best placement first (#1 on top), newest games as tiebreaker."""
+    def key(summary):
+        placement = summary.get("placement")
+        placement_rank = placement if isinstance(placement, int) else 999
+        return (placement_rank, -(summary.get("creation") or 0))
+    return sorted(summaries, key=key)
+
+
 def cdragon_icon_candidates(icon_path):
     """Ordered CDN URLs for a game asset (plugins tree + game tree)."""
     if not isinstance(icon_path, str) or not icon_path.strip():
@@ -3193,10 +3270,12 @@ class App:
                         aug_id, name = entry.get("id"), entry.get("name")
                         if isinstance(aug_id, int) and isinstance(name, str) and name:
                             icon = entry.get("iconLarge") or entry.get("iconSmall") or ""
+                            description = expand_augment_description(
+                                entry.get("desc"), entry.get("dataValues"))
                             augments[aug_id] = {
                                 "name": name,
                                 "icon_urls": cdragon_icon_candidates(icon),
-                                "tooltip": clean_game_text(entry.get("desc")),
+                                "tooltip": clean_game_text(description),
                             }
             except Exception:
                 pass
@@ -3268,6 +3347,7 @@ class App:
             except Exception as exc:
                 error = str(exc)
             summaries = [summarize_history_game(game) for game in games]
+            summaries = sort_history_summaries(summaries)
 
             def finish():
                 if self._closing:
@@ -3325,6 +3405,7 @@ class App:
 
         def worker():
             payload, error = None, None
+            identity = self._fetch_my_identity()
             try:
                 response = self.client.get(f"/lol-match-history/v1/games/{game_id}")
                 if response.status_code == 200:
@@ -3334,6 +3415,9 @@ class App:
             except Exception as exc:
                 error = str(exc)
             view = parse_match_detail(payload)
+            if view is not None:
+                view["me"] = select_local_player(
+                    view["players"], identity["ids"], identity["puuid"])
 
             def finish():
                 if self._closing:
@@ -3462,6 +3546,38 @@ class App:
                 pass
             self._tooltip = None
 
+    def _fetch_my_identity(self):
+        cached = getattr(self, "_my_identity_cache", None)
+        if cached:
+            return cached
+        account_ids, puuid = set(), ""
+        try:
+            response = self.client.get("/lol-summoner/v1/current-summoner")
+            if response.status_code == 200:
+                data = response.json()
+                for key in ("accountId", "currentAccountId"):
+                    value = data.get(key)
+                    if isinstance(value, int):
+                        account_ids.add(value)
+                puuid = str(data.get("puuid") or "")
+        except Exception:
+            pass
+        self._my_identity_cache = {"ids": account_ids, "puuid": puuid}
+        return self._my_identity_cache
+
+    def _refresh_history_scroll(self):
+        """Recompute the details scrollregion (after expand/collapse)."""
+        def do():
+            canvas = getattr(self, "history_detail_canvas", None)
+            if canvas is None:
+                return
+            try:
+                canvas.update_idletasks()
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except Exception:
+                pass
+        self._run_on_ui(do)
+
     def _toggle_player_build(self, player, panel_holder):
         """Expand/collapse one player's full build below their lobby row."""
         existing = None
@@ -3471,6 +3587,8 @@ class App:
         if existing is not None:
             self._hide_tooltip()
             existing.destroy()
+            panel_holder.update_idletasks()
+            self._refresh_history_scroll()
             return
         build = tk.Frame(panel_holder, bg="#0e1422",
                          highlightthickness=1,
@@ -3500,6 +3618,8 @@ class App:
             augments_row = tk.Frame(inner, bg="#0e1422")
             augments_row.pack(anchor="w")
             self._build_chips_into(augments_row, augments)
+        panel_holder.update_idletasks()
+        self._refresh_history_scroll()
 
     def _on_stat_column_change(self, *_args):
         if self._current_detail_view is not None and not self._closing:
@@ -3664,6 +3784,7 @@ class App:
             if player.get("participant_id") == me.get("participant_id"):
                 pass  # own row stays clickable too
             grid_row += 2
+        self._refresh_history_scroll()
         self._start_elo_lookup(players, token)
 
     def _detail_section(self, parent, title, content):
