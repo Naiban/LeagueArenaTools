@@ -450,8 +450,8 @@ _KNOWN_STAT_TOKENS = {
 }
 
 
-def expand_augment_description(text, data_values):
-    """Replace scaling placeholders with per-level numbers from dataValues."""
+def expand_augment_description(text, data_values, item_names=None):
+    """Replace scaling placeholders and item refs with real numbers/names."""
     if not isinstance(text, str):
         return ""
     values = data_values if isinstance(data_values, dict) else {}
@@ -486,13 +486,24 @@ def expand_augment_description(text, data_values):
             result += f" ({len(entries)} levels)"
         return result
 
+    def replace_item_ref(match):
+        try:
+            item_id = int(match.group(1))
+        except (TypeError, ValueError):
+            return ""
+        name = (item_names or {}).get(item_id)
+        return name or ""
+
     def replace_token(match):
         token = match.group(1)
         return _KNOWN_STAT_TOKENS.get(
             token, re.sub(r"(?<=[a-z])(?=[A-Z])", " ", token))
 
     text = re.sub(r"%:([A-Za-z0-9_]+)%", replace_scaled, text)
+    text = re.sub(r"%i:(\d+):i%", replace_item_ref, text)
     text = re.sub(r"@([A-Za-z]+)@", replace_token, text)
+    # Strip any remaining Riot template tokens without touching literal %.
+    text = re.sub(r"%(?:[a-zA-Z]:)?[A-Za-z0-9_]+(?::[a-zA-Z])?%", "", text)
     return text
 
 
@@ -509,13 +520,29 @@ def select_local_player(players, account_ids=frozenset(), puuid=""):
     return players[0] if players else {}
 
 
-def sort_history_summaries(summaries):
-    """Best placement first (#1 on top), newest games as tiebreaker."""
-    def key(summary):
-        placement = summary.get("placement")
-        placement_rank = placement if isinstance(placement, int) else 999
-        return (placement_rank, -(summary.get("creation") or 0))
-    return sorted(summaries, key=key)
+def order_players_by_placement(players):
+    """Duo teams ordered by the placement they achieved; singles last."""
+    duos, singles = {}, []
+    for player in players:
+        subteam = player.get("subteam_id")
+        if isinstance(subteam, int):
+            duos.setdefault(subteam, []).append(player)
+        else:
+            singles.append(player)
+
+    def duo_key(group):
+        placements = [g.get("placement") for g in group
+                      if isinstance(g.get("placement"), int)]
+        best = min(placements) if placements else 999
+        return (best, group[0].get("participant_id") or 0)
+
+    ordered = []
+    for group in sorted(duos.values(), key=duo_key):
+        ordered.extend(sorted(group,
+                              key=lambda p: p.get("participant_id") or 0))
+    ordered.extend(sorted(singles,
+                          key=lambda p: p.get("participant_id") or 0))
+    return ordered
 
 
 def cdragon_icon_candidates(icon_path):
@@ -2635,6 +2662,7 @@ class App:
         self._history_icon_refs = []
         self._tooltip = None
         self._tooltip_after_id = None
+        self._open_build_pid = None
         self._current_detail_view = None
         self._history_token = 0
         self._elo_cell_vars = {}
@@ -3270,8 +3298,11 @@ class App:
                         aug_id, name = entry.get("id"), entry.get("name")
                         if isinstance(aug_id, int) and isinstance(name, str) and name:
                             icon = entry.get("iconLarge") or entry.get("iconSmall") or ""
+                            item_names = {iid: info.get("name")
+                                          for iid, info in items.items()}
                             description = expand_augment_description(
-                                entry.get("desc"), entry.get("dataValues"))
+                                entry.get("desc"), entry.get("dataValues"),
+                                item_names)
                             augments[aug_id] = {
                                 "name": name,
                                 "icon_urls": cdragon_icon_candidates(icon),
@@ -3347,7 +3378,7 @@ class App:
             except Exception as exc:
                 error = str(exc)
             summaries = [summarize_history_game(game) for game in games]
-            summaries = sort_history_summaries(summaries)
+            # Newest game first (LCU already returns them newest-first).
 
             def finish():
                 if self._closing:
@@ -3398,6 +3429,7 @@ class App:
         if cached is not None:
             self._render_history_detail(cached)
             return
+        self._open_build_pid = None
         if not self.client.is_connected:
             self._set_history_status("League client is offline")
             return
@@ -3578,19 +3610,27 @@ class App:
                 pass
         self._run_on_ui(do)
 
-    def _toggle_player_build(self, player, panel_holder):
-        """Expand/collapse one player's full build below their lobby row."""
-        existing = None
-        for child in panel_holder.winfo_children():
-            existing = child
-            break
-        if existing is not None:
+    def _toggle_player_build(self, player, _panel_holder):
+        """Accordion behavior: clicking a row shows only that player's build;
+        clicking it again collapses. A full re-render guarantees clean layout
+        even where Tk shrinks-propagation misbehaves."""
+        participant_id = player.get("participant_id")
+        if self._open_build_pid == participant_id:
+            self._open_build_pid = None
+            self.log("History: build collapsed.")
+        else:
+            self._open_build_pid = participant_id
             self._hide_tooltip()
-            existing.destroy()
-            panel_holder.update_idletasks()
-            self._refresh_history_scroll()
+        if self._current_detail_view is not None:
+            try:
+                self._render_history_detail(self._current_detail_view)
+            except tk.TclError:
+                pass
+
+    def _attach_player_build_if_open(self, player, holder):
+        if self._open_build_pid != player.get("participant_id"):
             return
-        build = tk.Frame(panel_holder, bg="#0e1422",
+        build = tk.Frame(holder, bg="#0e1422",
                          highlightthickness=1,
                          highlightcolor=PANEL_BORDER,
                          highlightbackground=PANEL_BORDER)
@@ -3618,8 +3658,6 @@ class App:
             augments_row = tk.Frame(inner, bg="#0e1422")
             augments_row.pack(anchor="w")
             self._build_chips_into(augments_row, augments)
-        panel_holder.update_idletasks()
-        self._refresh_history_scroll()
 
     def _on_stat_column_change(self, *_args):
         if self._current_detail_view is not None and not self._closing:
@@ -3634,6 +3672,7 @@ class App:
             child.destroy()
         self._hide_tooltip()
         self._elo_cell_vars = {}
+        self._history_row_holders = {}
         self._current_detail_view = view
         self._history_token += 1
         token = self._history_token
@@ -3711,13 +3750,8 @@ class App:
                      font=("Segoe UI", 7, "bold"),
                      anchor="w").grid(row=0, column=column, sticky="ew")
 
-        # Group duo partners together (Arena pairs share playerSubteamId).
-        def group_key(player):
-            subteam = player.get("subteam_id")
-            return (1, 0, player.get("participant_id") or 0) if not isinstance(subteam, int) \
-                else (0, subteam, player.get("participant_id") or 0)
-
-        ordered = sorted(players, key=group_key)
+        # Duo teams ordered by the placement they achieved (winner on top).
+        ordered = order_players_by_placement(players)
         grid_row = 1
         previous_subteam = None
         team_ordinal = 0
@@ -3775,6 +3809,8 @@ class App:
 
             holder = tk.Frame(table, bg=PANEL_BG)
             holder.grid(row=grid_row + 1, column=0, columnspan=len(columns), sticky="ew")
+            self._history_row_holders[player.get("participant_id")] = holder
+            self._attach_player_build_if_open(player, holder)
 
             def toggle(_event, p=player, h=holder):
                 self._toggle_player_build(p, h)
