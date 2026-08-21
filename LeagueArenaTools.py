@@ -20,7 +20,7 @@ import psutil
 
 try:
     import pystray
-    from PIL import Image
+    from PIL import Image, ImageDraw
     TRAY_AVAILABLE = True
 except Exception:
     TRAY_AVAILABLE = False
@@ -191,6 +191,32 @@ DEFAULT_CONFIG = {
     "auto_update_enabled": True,
 }
 
+DEFAULT_STATS = {
+    "accepted": 0,
+    "picked": 0,
+    "games": 0,
+    "dodged": 0,
+}
+
+STAT_ITEMS = (
+    ("accepted", "MATCHES ACCEPTED"),
+    ("picked", "PICKS LOCKED"),
+    ("games", "GAMES PLAYED"),
+    ("dodged", "DODGES"),
+)
+
+
+def _sanitize_stats(value):
+    stats = dict(DEFAULT_STATS)
+    if isinstance(value, dict):
+        for key in stats:
+            try:
+                number = int(value.get(key, 0))
+            except (TypeError, ValueError):
+                number = 0
+            stats[key] = max(0, min(number, 10_000_000))
+    return stats
+
 
 def _merge_config(saved=None):
     saved = saved if isinstance(saved, dict) else {}
@@ -243,6 +269,7 @@ def load_profile_store():
         "format_version": PROFILE_STORE_VERSION,
         "active_profile": active_profile,
         "profiles": profiles,
+        "stats": _sanitize_stats(raw.get("stats") if isinstance(raw, dict) else None),
     }
 
 
@@ -471,12 +498,14 @@ class ChampionData():
 # =============================================================================
 
 class LeagueArenaToolsBot:
-    def __init__(self, client: LCUClient, log_callback, live_config: dict, champion_data: ChampionData):
+    def __init__(self, client: LCUClient, log_callback, live_config: dict, champion_data: ChampionData,
+                 stats_callback=None):
         self.client = client
         self.log = log_callback
         self.config = live_config
         self.champion_data = champion_data
         self.notifier = PushNotifier(live_config, log_callback)
+        self._stats_callback = stats_callback
 
         self._running = False
         self._lifecycle_lock = threading.RLock()
@@ -561,6 +590,14 @@ class LeagueArenaToolsBot:
     def _is_active(self, stop_event=None):
         event = stop_event or self._stop_event
         return self._running and self._stop_event is event and not event.is_set()
+
+    def _emit_stat(self, key):
+        if self._stats_callback is None:
+            return
+        try:
+            self._stats_callback(key)
+        except Exception:
+            pass
 
     def _wait(self, seconds, stop_event=None):
         event = stop_event or self._stop_event
@@ -703,9 +740,11 @@ class LeagueArenaToolsBot:
             self._champ_select_reset_done = False
 
         if previous_phase == "ChampSelect" and phase not in ("GameStart", "InProgress"):
+            self._emit_stat("dodged")
             self.notifier.notify("dodge", "Lobby reset - someone dodged or champ select was interrupted.")
 
         if phase == "InProgress" and previous_phase != "InProgress":
+            self._emit_stat("games")
             self._start_game_loaded_watch()
         elif previous_phase == "InProgress" and phase != "InProgress":
             self._stop_game_loaded_watch()
@@ -1021,6 +1060,7 @@ class LeagueArenaToolsBot:
             resp = self.client.post("/lol-matchmaking/v1/ready-check/accept")
             if resp.status_code in (200, 204):
                 self.log("Match accepted")
+                self._emit_stat("accepted")
                 self.notifier.notify("accept", "Match was accepted automatically.")
         except Exception as e:
             self.log(f"Auto Accept error: {e}")
@@ -1106,6 +1146,7 @@ class LeagueArenaToolsBot:
                     )
                     if ok:
                         self._done_actions.add(action_id)
+                        self._emit_stat("picked")
 
         debug_line = ",".join(my_actions)
         if debug_line and debug_line != self._last_action_debug:
@@ -2234,7 +2275,8 @@ class App:
         self.client = LCUClient()
         self.champion_data = ChampionData()
         self.bot_running = False
-        self.bot = LeagueArenaToolsBot(self.client, self.log, self.live_config, self.champion_data)
+        self.bot = LeagueArenaToolsBot(self.client, self.log, self.live_config, self.champion_data,
+                                       stats_callback=self._on_stat_event)
         self._init_variables()
         self._build_header()
         self._build_shell()
@@ -2267,6 +2309,10 @@ class App:
         self.var_minimize_to_tray = tk.BooleanVar(value=cfg.get("minimize_to_tray", True))
         self.var_auto_update = tk.BooleanVar(value=cfg.get("auto_update_enabled", True))
         self.var_delay_ms = tk.IntVar(value=int(cfg.get("delay_ms", 500)))
+
+        self.session_stats = dict(DEFAULT_STATS)
+        self.stat_vars = {key: tk.StringVar(value="0") for key, _ in STAT_ITEMS}
+        self.alltime_var = tk.StringVar(value="")
 
         bindings = (
             ("auto_accept", self.var_accept, self._bind_bool),
@@ -2430,6 +2476,72 @@ class App:
         self._info_row(overview.body, "Pick mode", self.var_pick_mode)
         self._info_row(overview.body, "Confirm delay", self.var_delay_ms, " ms")
         self._info_row(overview.body, "Accept delay", self.var_accept_delay_ms, " ms")
+        self._build_stats_card(page)
+
+    def _build_stats_card(self, page):
+        card = Card(page, "Session Stats")
+        card.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        strip = tk.Frame(card.body, bg=PANEL_BG)
+        strip.pack(fill="x")
+        MiniButton(strip, "Reset", width=7, command=self._reset_stats).pack(
+            side="right", padx=(12, 0))
+        for index, (key, label) in enumerate(STAT_ITEMS):
+            if index:
+                tk.Frame(strip, width=1, bg=PANEL_BORDER).pack(side="left", fill="y", pady=2)
+            block = tk.Frame(strip, bg=PANEL_BG)
+            block.pack(side="left", fill="both", expand=True)
+            tk.Label(block, text=label, bg=PANEL_BG, fg=TEXT_MUTED,
+                     font=("Segoe UI", 7, "bold")).pack(anchor="w")
+            tk.Label(block, textvariable=self.stat_vars[key], bg=PANEL_BG,
+                     fg=TEXT_PRIMARY, font=("Segoe UI", 13, "bold")).pack(anchor="w")
+        tk.Label(card.body, textvariable=self.alltime_var, bg=PANEL_BG,
+                 fg=TEXT_MUTED, font=("Segoe UI", 8)).pack(anchor="w", pady=(8, 0))
+        self._refresh_stat_labels()
+
+    def _on_stat_event(self, key):
+        if key not in DEFAULT_STATS:
+            return
+
+        def apply():
+            if self._closing:
+                return
+            self.session_stats[key] += 1
+            self.profile_store["stats"][key] += 1
+            self._refresh_stat_labels()
+            self._schedule_save()
+
+        try:
+            self.root.after(0, apply)
+        except tk.TclError:
+            pass
+
+    def _refresh_stat_labels(self):
+        for key, variable in self.stat_vars.items():
+            variable.set(str(self.session_stats.get(key, 0)))
+        totals = self.profile_store["stats"]
+        self.alltime_var.set(
+            "All time: "
+            + " · ".join((
+                f"{totals['accepted']} accepted",
+                f"{totals['picked']} picked",
+                f"{totals['games']} games",
+                f"{totals['dodged']} dodges",
+            ))
+        )
+
+    def _reset_stats(self):
+        if not messagebox.askyesno(
+            "Session stats",
+            "Reset the all-time statistics?\n\nSession counters restart with every app start anyway.",
+            parent=self.root,
+        ):
+            return
+        for key in DEFAULT_STATS:
+            self.session_stats[key] = 0
+            self.profile_store["stats"][key] = 0
+        self._refresh_stat_labels()
+        self._save_profiles_now()
+        self.log("Statistics reset.")
 
     def _build_champions(self, page):
         page.grid_columnconfigure(0, weight=1, uniform="champions")
@@ -3289,6 +3401,7 @@ class App:
             self.toggle_btn.set_text("Stop Bot")
             self._set_profile_controls_enabled(False)
             self.profile_notice_var.set("Stop the bot to change profiles.")
+            self._sync_tray_state()
             self.log("Bot started.")
 
     def _stop_bot(self, message=None):
@@ -3298,6 +3411,7 @@ class App:
         self.toggle_btn.set_text("Start Bot")
         self._set_profile_controls_enabled(True)
         self.profile_notice_var.set("")
+        self._sync_tray_state()
         if message:
             self.log(message)
 
@@ -3338,10 +3452,6 @@ class App:
         threading.Thread(target=self._tray_icon.run, name="LeagueArenaTools-Tray", daemon=True).start()
 
     def _build_tray_icon(self):
-        try:
-            image = Image.open(get_resource_path("league_arena_tools.ico"))
-        except Exception:
-            image = Image.new("RGB", (64, 64), color=(124, 92, 255))
         specs = [
             ("Auto Accept", "var_accept"), ("Auto Ban", "var_ban"),
             ("Auto Pick", "var_pick"), ("Hover", "var_hover"),
@@ -3357,7 +3467,41 @@ class App:
             pystray.Menu.SEPARATOR, *items, pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self._tray_quit),
         )
-        return pystray.Icon("league_arena_tools", image, f"{APP_TITLE} v{__version__}", menu)
+        return pystray.Icon("league_arena_tools", self._tray_image(),
+                            self._tray_title(), menu)
+
+    def _tray_title(self):
+        state = "bot running" if self.bot_running else "bot stopped"
+        return f"{APP_TITLE} v{__version__} ({state})"
+
+    def _tray_image(self):
+        try:
+            image = Image.open(get_resource_path("league_arena_tools.ico")).convert("RGBA")
+        except Exception:
+            image = Image.new("RGBA", (64, 64), (124, 92, 255, 255))
+        if self.bot_running:
+            # Green badge in the corner so the tray mirrors the bot state.
+            width, height = image.size
+            radius = max(5, width // 5)
+            pad = max(2, width // 32)
+            draw = ImageDraw.Draw(image)
+            cx, cy = width - radius - pad, height - radius - pad
+            draw.ellipse(
+                (cx - radius, cy - radius, cx + radius, cy + radius),
+                fill=(52, 211, 153, 255), outline=(8, 11, 18, 255),
+                width=max(1, width // 48),
+            )
+        return image
+
+    def _sync_tray_state(self):
+        icon = self._tray_icon
+        if icon is None:
+            return
+        try:
+            icon.icon = self._tray_image()
+            icon.title = self._tray_title()
+        except Exception:
+            pass
 
     def _tray_toggle_action(self, variable_name):
         def action(icon, item):
