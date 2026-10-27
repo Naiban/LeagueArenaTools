@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.04
+
+- Auto Pick: a priority champion that another player only hovers is no
+  longer skipped. It is skipped only once someone locks it in or bans it,
+  so Instant pick can take it first.
+
 ## 1.03
 
 - Faster start-up: the window appears before the network, process and tray

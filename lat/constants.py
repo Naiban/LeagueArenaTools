@@ -1,7 +1,7 @@
 """Values shared by several modules: version, title, Bravery and game phases."""
 
 
-__version__ = "1.03"
+__version__ = "1.04"
 APP_TITLE = "LeagueArenaTools"
 
 # Gameflow phases while a game runs ("Reconnect": the client lost the game

@@ -1174,15 +1174,14 @@ class LeagueArenaToolsBot:
                 yield from LeagueArenaToolsBot._walk_values(child)
 
     def _session_unavailable_champions(self, session):
+        # Another player's pick only blocks a champion once it is locked in:
+        # a hover reserves nothing, so skipping it would give the champion
+        # away to whoever merely hovered it first.
         ids = set()
-        local_cell = session.get("localPlayerCellId")
         for node in self._walk_values(session):
             cid = node.get("championId")
             if isinstance(cid, int) and cid > 0:
-                completed = node.get("completed")
-                action_type = node.get("type")
-                actor_cell = node.get("actorCellId")
-                if completed or action_type == "ban" or (action_type == "pick" and actor_cell != local_cell):
+                if node.get("completed") or node.get("type") == "ban":
                     ids.add(cid)
             cid = node.get("bannedChampionId")
             if isinstance(cid, int) and cid > 0:

@@ -82,6 +82,15 @@ class ChampSelectFixTests(BotFixTestCase):
         bot._perform_action(7, "pick", ["Ahri", "Fizz"], 30_000, instant=True)
         self.assertEqual(len(self.client.sent("GET", "/lol-champ-select/v1/pickable-champions")), 1)
 
+    def test_champion_hovered_by_another_player_is_still_picked(self):
+        session = self.session()
+        session["actions"][0].append({"id": 8, "actorCellId": 2, "type": "pick", "championId": 103,
+                                      "completed": False, "isInProgress": True})
+        bot = self.make_bot()
+        self.assertNotIn(103, bot._session_unavailable_champions(session))
+        session["actions"][0][1]["completed"] = True
+        self.assertIn(103, bot._session_unavailable_champions(session))
+
     def test_empty_pickable_list_does_not_block_the_pick(self):
         bot = self.make_bot(auto_pick=True, pick_mode="instant")
         self.client.routes[("GET", "/lol-champ-select/v1/pickable-champions")] = FakeResponse(200, [])
