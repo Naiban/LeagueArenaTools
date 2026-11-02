@@ -98,6 +98,48 @@ class ChampSelectFixTests(BotFixTestCase):
             200, {"actions": [[{"id": 7, "completed": True}]]})
         self.assertTrue(bot._perform_action(7, "pick", ["Ahri"], 30_000, instant=True))
 
+    def test_instant_pick_retries_until_the_client_locks_it(self):
+        # Arena: the client answers 204 but locks only on a later try.
+        bot = self.make_bot(auto_pick=True, pick_mode="instant")
+        tries = []
+
+        def session(_body):
+            done = len(tries) >= 3
+            return FakeResponse(200, {"actions": [[{"id": 7, "championId": 103, "completed": done,
+                                                    "isInProgress": True}]]})
+
+        def patch(body):
+            if body and body.get("completed"):
+                tries.append(body)
+            return FakeResponse(204)
+
+        self.client.routes[("GET", "/lol-champ-select/v1/session")] = session
+        self.client.routes[("PATCH", "/lol-champ-select/v1/session/actions/7")] = patch
+        self.client.routes[("POST", "/lol-champ-select/v1/session/actions/7/complete")] = \
+            lambda body: tries.append("complete") or FakeResponse(204)
+        self.assertTrue(bot._perform_action(7, "pick", ["Ahri"], 30_000, instant=True))
+        self.assertGreaterEqual(len(tries), 3)
+        self.assertTrue(any("Picked champion: Ahri" in line for line in self.logs))
+
+    def test_manual_lock_is_not_reported_as_the_bots_pick(self):
+        bot = self.make_bot(auto_pick=True, pick_mode="instant")
+        self.client.routes[("GET", "/lol-champ-select/v1/session")] = FakeResponse(
+            200, {"actions": [[{"id": 7, "championId": 105, "completed": True}]]})
+        self.assertTrue(bot._perform_action(7, "pick", ["Ahri"], 30_000, instant=True))
+        self.assertFalse(any("Picked champion: Ahri" in line for line in self.logs))
+        self.assertTrue(any("locked by hand: Fizz" in line for line in self.logs))
+
+    def test_missing_pickable_list_is_asked_once_per_champ_select(self):
+        bot = self.make_bot(auto_pick=True, pick_mode="instant")
+        for path in ("/lol-champ-select/v1/pickable-champion-ids", "/lol-champ-select/v1/pickable-champions"):
+            self.client.routes[("GET", path)] = FakeResponse(404)
+        self.client.routes[("GET", "/lol-champ-select/v1/session")] = FakeResponse(
+            200, {"actions": [[{"id": 7, "completed": True}]]})
+        bot._perform_action(7, "pick", ["Ahri"], 30_000, instant=True)
+        bot._perform_action(7, "pick", ["Ahri"], 30_000, instant=True)
+        self.assertEqual(len(self.client.sent("GET", "/lol-champ-select/v1/pickable-champion-ids")), 1)
+        self.assertFalse(any("Cannot fetch" in line for line in self.logs))
+
     def test_hover_is_sent_once_and_not_after_a_manual_change(self):
         bot = self.make_bot(hover_enabled=True, hover_champion="Ahri")
         bot._handle_champ_select(self.session(phase="PLANNING"))

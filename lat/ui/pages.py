@@ -61,7 +61,7 @@ class PagesMixin:
             ("dashboard", "  Dashboard"), ("champions", "  Champions"),
             ("automation", "  Automation"), ("status", "  Custom Status"),
             ("notifications", "  Notifications"), ("history", "  History"),
-            ("activity", "  Activity"),
+            ("skins", "  Skin Applier"), ("activity", "  Activity"),
         ):
             button = tk.Button(
                 sidebar, text=label, command=lambda page=key: self._show_page(page),
@@ -143,6 +143,7 @@ class PagesMixin:
         self._build_status(self.page_frames["status"])
         self._build_notifications(self.page_frames["notifications"])
         self._build_history(self.page_frames["history"])
+        self._build_skins(self.page_frames["skins"])
         self._build_activity(self.page_frames["activity"])
 
     def _build_dashboard(self, page):

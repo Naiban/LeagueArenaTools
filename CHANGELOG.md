@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.05
+
+- Instant pick/ban keeps resending the lock-in for up to 8 seconds until
+  the client really locks it. In Arena the client answered every request
+  but locked nothing right after the ban phase, so the pick was lost.
+- A champion you lock by hand is no longer logged as the bot's pick.
+- The owned-champion list uses the endpoint newer clients serve; the
+  repeated "Cannot fetch pickable champion list (404)" is gone.
+- New Skin Applier page: browse the skins and chromas you own per champion
+  with their splash art and choose one per champion. With Auto Skin on, the
+  bot selects it as soon as your champion is locked (Bravery included), once
+  per champ select, so a skin you change by hand is left alone.
+
 ## 1.04
 
 - Auto Pick: a priority champion that another player only hovers is no

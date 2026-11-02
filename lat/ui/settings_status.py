@@ -170,6 +170,9 @@ class SettingsStatusMixin:
         elif key in ("lobby_message_enabled", "lobby_message_text"):
             if cfg.get("lobby_message_enabled") and not (cfg.get("lobby_message_text") or "").strip():
                 return "the message text is empty"
+        elif key in ("skin_apply_enabled", "skin_choices"):
+            if cfg.get("skin_apply_enabled") and not cfg.get("skin_choices"):
+                return "no skins chosen yet - pick them on the Skin Applier page"
         elif key in ("push_enabled", "push_topic", "push_events"):
             if cfg.get("push_enabled"):
                 if not (cfg.get("push_topic") or "").strip():

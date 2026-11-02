@@ -30,6 +30,7 @@ from lat.ui.pages import PagesMixin
 from lat.ui.profiles import ProfilesMixin
 from lat.ui.ratings import RatingsMixin
 from lat.ui.settings_status import SettingsStatusMixin
+from lat.ui.skins_page import SkinsPageMixin
 from lat.ui.theme import (
     ACCENT_ALT, BG, DANGER, PANEL_ALT, SIDEBAR_BG, SUCCESS, TEXT_MUTED, TEXT_PRIMARY, WIN_H,
     WIN_W,
@@ -50,7 +51,7 @@ UI_DRAIN_MS = 20
 
 class App(PagesMixin, ProfilesMixin, SettingsStatusMixin, CustomStatusMixin, UpdatesMixin,
           HistoryPageMixin, MatchViewMixin, ArenaOverviewMixin, LiveLobbyMixin, RatingsMixin,
-          IconTooltipMixin, TrayMixin):
+          SkinsPageMixin, IconTooltipMixin, TrayMixin):
     PAGE_META = {
         "dashboard": ("Dashboard", "Live status and the most important switches"),
         "champions": ("Champions", "Hover, ban, pick and favorite priorities"),
@@ -58,6 +59,7 @@ class App(PagesMixin, ProfilesMixin, SettingsStatusMixin, CustomStatusMixin, Upd
         "status": ("Custom Status", "Set the status shown in the League client"),
         "notifications": ("Notifications", "Private phone alerts delivered through ntfy"),
         "history": ("Match History", "Your games with builds, lobby ratings and Arena stats"),
+        "skins": ("Skin Applier", "Choose a skin per champion - selected for you in champ select"),
         "activity": ("Activity", "Runtime events and diagnostics"),
     }
 
@@ -124,6 +126,14 @@ class App(PagesMixin, ProfilesMixin, SettingsStatusMixin, CustomStatusMixin, Upd
         self._live_token = 0
         self._gameflow_phase = None
         self._history_refresh_token = 0
+        # Skin Applier tab state.
+        self.skin_status_var = tk.StringVar(value="Not loaded")
+        self._skin_catalog = None         # champion id -> owned skins, None until loaded
+        self._skins_loading = False
+        self._skin_champion_id = None
+        self._skin_list_ids = []
+        self._skin_cards = []
+        self._skin_columns = 0
 
         root.title(f"{APP_TITLE} v{__version__}")
         root.minsize(920, 700)
@@ -189,6 +199,7 @@ class App(PagesMixin, ProfilesMixin, SettingsStatusMixin, CustomStatusMixin, Upd
             value=str(cfg.get("history_stat_column") or "damage"))
         self.var_history_arena_only = tk.BooleanVar(
             value=bool(cfg.get("history_arena_only", True)))
+        self.var_skin_apply = tk.BooleanVar(value=cfg.get("skin_apply_enabled", False))
 
         self.session_stats = dict(DEFAULT_STATS)
         self.stat_total_vars = {key: tk.StringVar(value="0") for key, _ in STAT_ITEMS}
@@ -217,6 +228,7 @@ class App(PagesMixin, ProfilesMixin, SettingsStatusMixin, CustomStatusMixin, Upd
             ("arenasweats_region", self.var_history_region, self._bind_str),
             ("history_stat_column", self.var_history_stat, self._bind_str),
             ("history_arena_only", self.var_history_arena_only, self._bind_bool),
+            ("skin_apply_enabled", self.var_skin_apply, self._bind_bool),
         )
         for key, variable, binder in bindings:
             binder(key, variable)
@@ -316,6 +328,8 @@ class App(PagesMixin, ProfilesMixin, SettingsStatusMixin, CustomStatusMixin, Upd
             active = key == name
             button.configure(bg=PANEL_ALT if active else SIDEBAR_BG,
                              fg=TEXT_PRIMARY if active else TEXT_MUTED)
+        if name == "skins":
+            self._on_skins_page_shown()
 
     def _set_connection_status(self, connected):
         self.status_dot_canvas.itemconfig(self.status_dot, fill=SUCCESS if connected else DANGER)

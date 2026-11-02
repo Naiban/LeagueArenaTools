@@ -25,6 +25,11 @@ WEBSOCKET_PING_INTERVAL = 30
 GAME_END_REPORT_ATTEMPTS = 40
 GAME_END_REPORT_INTERVAL_S = 4.0
 HOVER_RETRY_S = 2.0
+INSTANT_RETRY_S = 8.0     # keep resending an instant lock-in this long
+INSTANT_CHECK_S = 0.35    # wait this long for the client after each try
+INSTANT_POLL_S = 0.05
+SKIN_ATTEMPTS = 3
+SKIN_DONE = -1
 
 
 class LeagueArenaToolsBot:
@@ -59,6 +64,8 @@ class LeagueArenaToolsBot:
         self._cs_kind_status = {}    # "ban"/"pick" -> "open" | "done"
         self._cs_inflight_kind = None
         self._cs_hover_reset = False
+        self._cs_skin_reset = False
+        self._skin_attempts = {}     # champion id -> tries, or SKIN_DONE
 
         self._done_actions = set()
         self._hovered_actions = set()
@@ -778,6 +785,8 @@ class LeagueArenaToolsBot:
             self._last_action_debug = ""
             self._last_hover_log = ""
             self._cs_hover_reset = False
+            self._cs_skin_reset = False
+            self._skin_attempts.clear()
         elif self._cs_hover_reset:
             # Hover champion changed mid champ select: hover again.
             self._cs_hover_reset = False
@@ -785,6 +794,10 @@ class LeagueArenaToolsBot:
             self._pending_hovers.clear()
             self._last_hover_attempt.clear()
             self._last_hover_log = ""
+        if self._cs_skin_reset:
+            # Skin choice changed mid champ select: apply the new one.
+            self._cs_skin_reset = False
+            self._skin_attempts.clear()
 
     def _on_ready_check_event(self, data):
         if not isinstance(data, dict):
@@ -969,6 +982,15 @@ class LeagueArenaToolsBot:
         if key in ("push_enabled", "push_topic", "push_events"):
             return "active", "used for the next notification"
 
+        if key in ("skin_apply_enabled", "skin_choices"):
+            if not cfg.get("skin_apply_enabled"):
+                return "active", "skins are left to you"
+            if not in_champ_select:
+                return "active", "used in the next champ select"
+            self._cs_skin_reset = True
+            self.recheck_champ_select()
+            return "active", "applying in the current champ select"
+
         return "active", "applied"
 
     def _defer(self, key, trigger, detail):
@@ -1021,6 +1043,9 @@ class LeagueArenaToolsBot:
                 else:
                     kind_status.setdefault(kind, "done")
         self._cs_kind_status = kind_status
+
+        if self.config.get("skin_apply_enabled") and kind_status.get("pick") != "open":
+            self._maybe_apply_skin(session, local_cell)
 
         self._confirm_pending_hovers(session)
 
@@ -1110,6 +1135,44 @@ class LeagueArenaToolsBot:
             self._last_action_debug = debug_line
             self.log(f"Champ select actions: {debug_line}")
 
+    def _maybe_apply_skin(self, session, local_cell):
+        """Select the saved skin once the champion is locked (Bravery, ARAM
+        or a normal pick). Sent once per champion and champ select, so a
+        skin the player changes by hand afterwards is left alone."""
+        me = next((member for member in session.get("myTeam") or []
+                   if member.get("cellId") == local_cell), None)
+        champion_id = (me or {}).get("championId") or 0
+        if champion_id <= 0:
+            return
+        attempts = self._skin_attempts.get(champion_id, 0)
+        if attempts == SKIN_DONE or attempts >= SKIN_ATTEMPTS:
+            return
+        choice = (self.config.get("skin_choices") or {}).get(str(champion_id))
+        if not choice:
+            self._skin_attempts[champion_id] = SKIN_DONE
+            return
+        skin_id = choice.get("skin_id")
+        champion = self.champion_data.label(champion_id)
+        label = choice.get("name") or str(skin_id)
+        if me.get("selectedSkinId") == skin_id:
+            self._skin_attempts[champion_id] = SKIN_DONE
+            return
+        try:
+            response = self._request_if_active(
+                self._stop_event, self.client.patch,
+                "/lol-champ-select/v1/session/my-selection", {"selectedSkinId": skin_id})
+        except Exception as e:
+            response, error = None, str(e)
+        else:
+            error = f"HTTP {response.status_code}" if response is not None else "bot stopped"
+        if response is not None and 200 <= response.status_code < 300:
+            self._skin_attempts[champion_id] = SKIN_DONE
+            self.log(f"Auto Skin: {label} selected for {champion}.")
+            return
+        self._skin_attempts[champion_id] = attempts + 1
+        if attempts + 1 >= SKIN_ATTEMPTS:
+            self.log(f"Auto Skin: could not select {label} for {champion} ({error}).")
+
     def _hover_attempt_due(self, action_id):
         """A hover not yet confirmed is sent again at most every 2 s."""
         if action_id in self._hovered_actions:
@@ -1126,23 +1189,36 @@ class LeagueArenaToolsBot:
         cache_key = (self._cs_epoch, kind)
         if self._available_cache_key == cache_key:
             return self._available_cache
-        endpoint = (
-            "/lol-champ-select/v1/bannable-champions" if kind == "ban"
-            else "/lol-champ-select/v1/pickable-champions"
-        )
         list_name = "bannable" if kind == "ban" else "pickable"
+        # Newer clients only serve the *-champion-ids endpoint.
+        endpoints = (
+            f"/lol-champ-select/v1/{list_name}-champion-ids",
+            f"/lol-champ-select/v1/{list_name}-champions",
+        )
         available = None
-        try:
-            r = self.client.get(endpoint)
+        missing = 0
+        errors = []
+        for endpoint in endpoints:
+            try:
+                r = self.client.get(endpoint)
+            except Exception as e:
+                errors.append(str(e))
+                continue
             if r.status_code == 200:
                 available = self._extract_champion_ids(r.json()) or None
-            else:
-                self.log(f"Cannot fetch {list_name} champion list ({r.status_code})")
-        except Exception as e:
-            self.log(f"Cannot fetch {list_name} champion list ({e})")
-        # An empty list (asked too early) is not cached: ask again next time.
+                break
+            if r.status_code == 404:
+                missing += 1
+            errors.append(str(r.status_code))
         if available:
             self._available_cache_key, self._available_cache = cache_key, available
+        elif missing == len(endpoints):
+            # Not served in this queue (e.g. Arena): stop asking until the
+            # next champ select, the client checks ownership itself.
+            self._available_cache_key, self._available_cache = cache_key, None
+        elif errors:
+            self._log_once(f"Cannot fetch {list_name} champion list ({', '.join(errors)})")
+        # An empty list (asked too early) is not cached: ask again next time.
         return available
 
     def _mark_kind_done(self, kind):
@@ -1346,7 +1422,7 @@ class LeagueArenaToolsBot:
                                    f"checking next {kind} priority.")
                     continue
                 if instant:
-                    return self._instant_action(action_id, kind, entry)
+                    return self._instant_action(action_id, kind, entry, timer_ms)
                 if not self._set_action_champion(action_id, entry, kind):
                     self.log(f"Failed to set champion for action '{kind}'")
                     return False
@@ -1376,7 +1452,7 @@ class LeagueArenaToolsBot:
             return False
 
         if instant:
-            return self._instant_action(action_id, kind, chosen)
+            return self._instant_action(action_id, kind, chosen, timer_ms)
 
         if not self._set_action_champion(action_id, chosen, kind):
             self.log(f"Failed to set champion for action '{kind}'")
@@ -1396,77 +1472,96 @@ class LeagueArenaToolsBot:
             self.log(f"Failed to complete action '{kind}'")
             return False
 
-    def _instant_action(self, action_id, kind, champion_id):
+    def _instant_action(self, action_id, kind, champion_id, timer_ms=None):
+        """Lock in at once and keep retrying until the client shows it.
+
+        The client can answer 204 and still not lock the champion yet (Arena
+        right after the ban phase), so a single burst is not enough: the
+        lock-in is resent every few hundred ms until the action is completed,
+        the turn ends, the champ select changes or the time runs out."""
         stop_event = self._stop_event
         if not self._is_active(stop_event):
             return False
-        primary = (
-            self.client.patch,
-            f"/lol-champ-select/v1/session/actions/{action_id}",
-            {"championId": champion_id, "completed": True},
-        )
-        burst = [
-            (self.client.patch, f"/lol-champ-select/v1/session/actions/{action_id}", {"championId": champion_id, "completed": True}),
-            (self.client.patch, f"/lol-champ-select/v1/session/actions/{action_id}", {"completed": True, "championId": champion_id}),
-            (self.client.post, f"/lol-champ-select/v1/session/actions/{action_id}/complete", None),
-            (self.client.patch, f"/lol-champ-select/v1/session/actions/{action_id}", {"championId": champion_id}),
-            (self.client.patch, f"/lol-champ-select/v1/session/actions/{action_id}", {"completed": True}),
-            (self.client.patch, f"/lol-champ-select/v1/session/actions/{action_id}", {"championId": champion_id, "completed": True}),
-            (self.client.post, f"/lol-champ-select/v1/session/actions/{action_id}/complete", None),
-        ]
-        if kind == "pick":
-            my_selection = (
-                self.client.patch,
-                "/lol-champ-select/v1/session/my-selection",
-                {"championId": champion_id},
-            )
-            burst[1:1] = [
-                my_selection,
-                (self.client.patch, "/lol-champ-select/v1/session/my-selection", {"championId": champion_id}),
-                (self.client.patch, "/lol-champ-select/v1/session/my-selection", {"championPickIntent": champion_id}),
-                my_selection,
-            ]
-
-        statuses = []
-        status_lock = threading.Lock()
+        epoch = self._cs_epoch
+        action_path = f"/lol-champ-select/v1/session/actions/{action_id}"
+        try:
+            budget = INSTANT_RETRY_S if timer_ms is None else min(
+                INSTANT_RETRY_S, max(1.0, (int(timer_ms) - 1000) / 1000))
+        except (TypeError, ValueError):
+            budget = INSTANT_RETRY_S
+        deadline = time.monotonic() + budget
 
         def _send(func, path, body):
-            if not self._is_active(stop_event):
-                return
             try:
-                resp = func(path, json=body)
-                item = f"{path}:{resp.status_code}"
+                resp = self._request_if_active(stop_event, func, path, body)
             except Exception as e:
-                item = f"{path}:ERR {e}"
-            with status_lock:
-                statuses.append(item)
+                return f"ERR {e}"
+            return "stopped" if resp is None else str(resp.status_code)
 
-        _send(*primary)
-        threads = []
-        for item in burst:
-            t = threading.Thread(target=_send, args=item, daemon=True)
-            t.start()
-            threads.append(t)
-
-        for _ in range(10):
-            if not self._is_active(stop_event):
+        attempts = 0
+        statuses = []
+        last_action = None
+        while True:
+            if not self._is_active(stop_event) or epoch != self._cs_epoch:
                 return False
-            action = self._get_action_by_id(action_id)
-            if action and action.get("completed"):
-                label = "Banned" if kind == "ban" else "Picked"
-                champ_label = self.champion_data.label(champion_id)
-                self.log(f"{label} champion: {champ_label}")
-                if kind == "ban":
-                    self.notifier.notify("ban", f"Banned: {champ_label}")
-                return True
-            if not self._wait(0.02, stop_event):
+            if not self.config.get(f"auto_{kind}"):
+                self.log(f"Auto {kind.title()} was turned off - not locking in.")
                 return False
+            if attempts % 2 == 0:
+                requests_to_send = [(self.client.patch, action_path,
+                                     {"championId": champion_id, "completed": True})]
+            else:
+                # Alternate with select-then-complete, which some queues need.
+                requests_to_send = [(self.client.patch, action_path, {"championId": champion_id})]
+                if kind == "pick":
+                    requests_to_send.append((self.client.patch, "/lol-champ-select/v1/session/my-selection",
+                                             {"championId": champion_id}))
+                requests_to_send.append((self.client.post, f"{action_path}/complete", None))
+            statuses = [f"{path.rsplit('/', 1)[-1]}:{_send(func, path, body)}"
+                        for func, path, body in requests_to_send]
+            attempts += 1
 
-        for t in threads:
-            t.join(timeout=0.02)
+            check_until = min(deadline, time.monotonic() + INSTANT_CHECK_S)
+            while True:
+                if not self._is_active(stop_event) or epoch != self._cs_epoch:
+                    return False
+                action = self._get_action_by_id(action_id)
+                if action is not None:
+                    last_action = action
+                    if action.get("completed"):
+                        self._log_locked(kind, champion_id, action)
+                        return True
+                    if action.get("isInProgress") is False:
+                        self.log(f"Instant {kind}: the turn ended before the lock-in.")
+                        return False
+                if time.monotonic() >= check_until:
+                    break
+                if not self._wait(INSTANT_POLL_S, stop_event):
+                    return False
+            if time.monotonic() >= deadline:
+                break
 
-        self.log(f"Instant {kind} unconfirmed: " + " | ".join(statuses))
+        state = ""
+        if last_action is not None:
+            state = (f" (client shows champion {last_action.get('championId')}, "
+                     f"in progress {last_action.get('isInProgress')})")
+        self.log(f"Instant {kind} not locked after {attempts} tries in {budget:.0f}s{state}: "
+                 + " | ".join(statuses))
         return False
+
+    def _log_locked(self, kind, champion_id, action):
+        locked_id = action.get("championId") or champion_id
+        champ_label = self.champion_data.label(locked_id)
+        if champion_id < 0:   # Bravery: the client swaps in a random champion
+            self.log(f"Picked champion: Bravery ({champ_label})")
+            return
+        if locked_id != champion_id:
+            self.log(f"{kind.title()} locked by hand: {champ_label}")
+            return
+        label = "Banned" if kind == "ban" else "Picked"
+        self.log(f"{label} champion: {champ_label}")
+        if kind == "ban":
+            self.notifier.notify("ban", f"Banned: {champ_label}")
 
     def _set_action_champion(self, action_id, champion_id, kind):
         stop_event = self._stop_event

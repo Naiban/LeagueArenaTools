@@ -125,6 +125,7 @@ class ProfilesMixin:
             (self.var_minimize_to_tray, bool(cfg.get("minimize_to_tray", True))),
             (self.var_auto_update, bool(cfg.get("auto_update_enabled", True))),
             (self.var_delay_ms, int(cfg.get("delay_ms", 500))),
+            (self.var_skin_apply, bool(cfg.get("skin_apply_enabled", False))),
         )
         for variable, value in values:
             variable.set(value)
@@ -135,6 +136,7 @@ class ProfilesMixin:
         self.pick_editor.set_list(cfg.get("pick_priority", []))
         self.hover_picker.set_value(cfg.get("hover_champion", ""))
         self.favorites_panel.set_list(cfg.get("favorites", []))
+        self._refresh_skin_view()
         self._set_custom_status_editor(cfg.get("custom_status_text", ""))
         self.custom_status_info_var.set("Not loaded")
 

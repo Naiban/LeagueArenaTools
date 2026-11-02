@@ -11,6 +11,7 @@ from datetime import datetime
 
 from lat.constants import BRAVERY_LABEL
 from lat.paths import get_base_dir
+from lat.skins import sanitize_skin_choices
 
 
 CONFIG_PATH = os.path.join(get_base_dir(), "league_arena_tools_config.json")
@@ -46,6 +47,8 @@ DEFAULT_CONFIG = {
     "lobby_message_text": "",
     "custom_status_text": "",
     "auto_requeue_enabled": False,
+    "skin_apply_enabled": False,
+    "skin_choices": {},          # "<champion id>" -> {"skin_id", "name"}
     "arenasweats_region": "euw",
     "history_stat_column": "damage",
     "history_arena_only": True,
@@ -87,6 +90,8 @@ BOT_SETTING_LABELS = {
     "push_enabled": "Phone notifications",
     "push_topic": "Notification topic",
     "push_events": "Notification events",
+    "skin_apply_enabled": "Auto Skin",
+    "skin_choices": "Skin choice",
 }
 # Free-text and spinbox fields change per keystroke/click; report them once
 # the value settles instead of once per character.
@@ -96,7 +101,7 @@ TYPED_SETTING_KEYS = frozenset({
 # One key per validation group, used for the full check on bot start.
 SETTING_CHECK_KEYS = (
     "auto_accept", "auto_ban", "auto_pick", "hover_enabled",
-    "lobby_message_enabled", "push_enabled",
+    "lobby_message_enabled", "push_enabled", "skin_apply_enabled",
 )
 # Ready checks close after roughly ten seconds.
 READY_CHECK_SAFE_DELAY_MS = 9000
@@ -175,6 +180,7 @@ def _merge_config(saved=None):
         cfg["push_events"] = merged_events
     else:
         cfg["push_events"] = copy.deepcopy(DEFAULT_CONFIG["push_events"])
+    cfg["skin_choices"] = sanitize_skin_choices(cfg.get("skin_choices"))
     return cfg
 
 
