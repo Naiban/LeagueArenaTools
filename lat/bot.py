@@ -105,6 +105,7 @@ class LeagueArenaToolsBot:
         # Champions the client offers this player, per champ select and kind.
         self._available_cache_key = None
         self._available_cache = None
+        self._available_hovered = set()
 
     @property
     def phase(self):
@@ -1183,12 +1184,15 @@ class LeagueArenaToolsBot:
         self._last_hover_attempt[action_id] = now
         return True
 
-    def _available_champions(self, kind):
+    def _available_champions(self, kind, hovered=frozenset(), refresh=False):
         """Champion ids the client lets this player ban or pick (owned and
-        enabled), or None when unknown. Fetched once per champ select."""
+        enabled), or None when unknown. Fetched once per champ select unless
+        refresh is set. The client also leaves out champions someone is
+        hovering, so the hovers seen at fetch time are kept with the list."""
         cache_key = (self._cs_epoch, kind)
-        if self._available_cache_key == cache_key:
+        if self._available_cache_key == cache_key and not refresh:
             return self._available_cache
+        self._available_hovered = set(hovered)
         list_name = "bannable" if kind == "ban" else "pickable"
         # Newer clients only serve the *-champion-ids endpoint.
         endpoints = (
@@ -1227,17 +1231,22 @@ class LeagueArenaToolsBot:
         self._cs_kind_status = status
 
     def _get_action_by_id(self, action_id):
+        return self._get_session_and_action(action_id)[1]
+
+    def _get_session_and_action(self, action_id):
         try:
             r = self.client.get("/lol-champ-select/v1/session")
             if r.status_code != 200:
-                return None
-            for group in r.json().get("actions", []):
+                return None, None
+            session = r.json()
+            for group in session.get("actions", []):
                 for action in group:
                     if action.get("id") == action_id:
-                        return action
+                        return session, action
+            return session, None
         except Exception:
             pass
-        return None
+        return None, None
 
     @staticmethod
     def _walk_values(value):
@@ -1261,6 +1270,19 @@ class LeagueArenaToolsBot:
                     ids.add(cid)
             cid = node.get("bannedChampionId")
             if isinstance(cid, int) and cid > 0:
+                ids.add(cid)
+        return ids
+
+    def _session_hovered_champions(self, session):
+        """Champions someone is hovering but has not locked in yet."""
+        ids = set()
+        for node in self._walk_values(session or {}):
+            cid = node.get("championPickIntent")
+            if isinstance(cid, int) and cid > 0:
+                ids.add(cid)
+            cid = node.get("championId")
+            if (isinstance(cid, int) and cid > 0 and node.get("type") == "pick"
+                    and not node.get("completed")):
                 ids.add(cid)
         return ids
 
@@ -1405,7 +1427,8 @@ class LeagueArenaToolsBot:
             return False
         # Champions this player cannot use (not owned, disabled) are skipped
         # like banned ones, instead of failing on the same entry every update.
-        available = self._available_champions(kind)
+        hovered = self._session_hovered_champions(session)
+        available = self._available_champions(kind, hovered)
         verb = "banned" if kind == "ban" else "picked"
 
         if priority_entries:
@@ -1417,13 +1440,28 @@ class LeagueArenaToolsBot:
                 if entry in unavailable:
                     self.log(f"{label} unavailable - checking next {kind} priority.")
                     continue
-                if available is not None and entry not in available:
+                # A hover reserves nothing, but the client drops a hovered
+                # champion from the list: only a champion nobody hovers is
+                # really not owned or disabled.
+                if (available is not None and entry not in available and entry not in hovered
+                        and entry in self._available_hovered):
+                    # Hovered when the list was fetched, not any more: ask again.
+                    available = self._available_champions(kind, hovered, refresh=True)
+                if available is not None and entry not in available and entry not in hovered:
                     self._log_once(f"{label} cannot be {verb} (not owned or disabled) - "
                                    f"checking next {kind} priority.")
                     continue
+                may_be_unpickable = available is not None and entry not in available
                 if instant:
-                    return self._instant_action(action_id, kind, entry, timer_ms)
+                    result = self._instant_action(action_id, kind, entry, timer_ms,
+                                                  may_be_unpickable=may_be_unpickable)
+                    if result is None:
+                        continue
+                    return result
                 if not self._set_action_champion(action_id, entry, kind):
+                    if may_be_unpickable:
+                        self._log_once(f"{label} cannot be {verb} - checking next {kind} priority.")
+                        continue
                     self.log(f"Failed to set champion for action '{kind}'")
                     return False
                 if not self._sleep_before_action(timer_ms, kind):
@@ -1452,7 +1490,7 @@ class LeagueArenaToolsBot:
             return False
 
         if instant:
-            return self._instant_action(action_id, kind, chosen, timer_ms)
+            return bool(self._instant_action(action_id, kind, chosen, timer_ms))
 
         if not self._set_action_champion(action_id, chosen, kind):
             self.log(f"Failed to set champion for action '{kind}'")
@@ -1472,13 +1510,17 @@ class LeagueArenaToolsBot:
             self.log(f"Failed to complete action '{kind}'")
             return False
 
-    def _instant_action(self, action_id, kind, champion_id, timer_ms=None):
+    def _instant_action(self, action_id, kind, champion_id, timer_ms=None, may_be_unpickable=False):
         """Lock in at once and keep retrying until the client shows it.
 
         The client can answer 204 and still not lock the champion yet (Arena
         right after the ban phase), so a single burst is not enough: the
         lock-in is resent every few hundred ms until the action is completed,
-        the turn ends, the champ select changes or the time runs out."""
+        the turn ends, the champ select changes or the time runs out.
+
+        Returns None when the champion cannot be had - another player locked
+        it first, or (may_be_unpickable) the client rejects it - so the caller
+        can try the next priority."""
         stop_event = self._stop_event
         if not self._is_active(stop_event):
             return False
@@ -1499,8 +1541,10 @@ class LeagueArenaToolsBot:
             return "stopped" if resp is None else str(resp.status_code)
 
         attempts = 0
+        rejected_tries = 0
         statuses = []
         last_action = None
+        label = self.champion_data.label(champion_id)
         while True:
             if not self._is_active(stop_event) or epoch != self._cs_epoch:
                 return False
@@ -1517,15 +1561,24 @@ class LeagueArenaToolsBot:
                     requests_to_send.append((self.client.patch, "/lol-champ-select/v1/session/my-selection",
                                              {"championId": champion_id}))
                 requests_to_send.append((self.client.post, f"{action_path}/complete", None))
-            statuses = [f"{path.rsplit('/', 1)[-1]}:{_send(func, path, body)}"
-                        for func, path, body in requests_to_send]
+            codes = [_send(func, path, body) for func, path, body in requests_to_send]
+            statuses = [f"{path.rsplit('/', 1)[-1]}:{code}"
+                        for (_func, path, _body), code in zip(requests_to_send, codes)]
             attempts += 1
+            # Both request variants refused on the action: the client will not take it.
+            accepted = any(code in ("200", "204") for (_func, path, _body), code in zip(requests_to_send, codes)
+                           if path.startswith(action_path))
+            rejected_tries = 0 if accepted else rejected_tries + 1
+            if may_be_unpickable and rejected_tries >= 2:
+                self.log(f"{label} cannot be {'banned' if kind == 'ban' else 'picked'} "
+                         f"({' | '.join(statuses)}) - checking next {kind} priority.")
+                return None
 
             check_until = min(deadline, time.monotonic() + INSTANT_CHECK_S)
             while True:
                 if not self._is_active(stop_event) or epoch != self._cs_epoch:
                     return False
-                action = self._get_action_by_id(action_id)
+                session, action = self._get_session_and_action(action_id)
                 if action is not None:
                     last_action = action
                     if action.get("completed"):
@@ -1534,6 +1587,10 @@ class LeagueArenaToolsBot:
                     if action.get("isInProgress") is False:
                         self.log(f"Instant {kind}: the turn ended before the lock-in.")
                         return False
+                if (kind == "pick" and champion_id > 0 and session is not None
+                        and champion_id in self._session_unavailable_champions(session)):
+                    self.log(f"{label} was locked by another player first - checking next pick priority.")
+                    return None
                 if time.monotonic() >= check_until:
                     break
                 if not self._wait(INSTANT_POLL_S, stop_event):

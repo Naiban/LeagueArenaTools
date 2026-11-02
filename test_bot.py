@@ -91,6 +91,85 @@ class ChampSelectFixTests(BotFixTestCase):
         session["actions"][0][1]["completed"] = True
         self.assertIn(103, bot._session_unavailable_champions(session))
 
+    def hovered_by_other(self, champion_id=103):
+        session = self.session()
+        session["actions"][0].append({"id": 8, "actorCellId": 2, "type": "pick", "championId": champion_id,
+                                      "completed": False, "isInProgress": True})
+        return session
+
+    def route_pick(self, accept, other_locks=None):
+        """PATCH/POST on action 7 lock `accept` ids; others get 400."""
+        state = {"locked": None}
+
+        def patch(body):
+            cid = (body or {}).get("championId")
+            if cid not in accept:
+                return FakeResponse(400)
+            if body.get("completed"):
+                state["locked"] = cid
+            return FakeResponse(204)
+
+        def session(_body):
+            actions = [{"id": 7, "championId": state["locked"], "completed": state["locked"] is not None,
+                        "isInProgress": True}]
+            if other_locks:
+                actions.append({"id": 8, "type": "pick", "championId": other_locks, "completed": True})
+            return FakeResponse(200, {"actions": [actions]})
+
+        self.client.routes[("PATCH", "/lol-champ-select/v1/session/actions/7")] = patch
+        self.client.routes[("POST", "/lol-champ-select/v1/session/actions/7/complete")] = \
+            lambda _b: FakeResponse(400)
+        self.client.routes[("GET", "/lol-champ-select/v1/session")] = session
+        return state
+
+    def test_champion_hovered_by_another_player_is_instant_locked(self):
+        # The client leaves a hovered champion out of the pickable list.
+        bot = self.make_bot(auto_pick=True, pick_mode="instant")
+        self.client.routes[("GET", "/lol-champ-select/v1/pickable-champions")] = FakeResponse(200, [105])
+        state = self.route_pick(accept={103, 105})
+        self.assertTrue(bot._perform_action(7, "pick", ["Ahri", "Fizz"], 30_000, instant=True,
+                                            session=self.hovered_by_other()))
+        self.assertEqual(state["locked"], 103)
+        self.assertFalse(any("not owned" in line for line in self.logs))
+
+    def test_hovered_champion_the_client_refuses_falls_to_next_priority(self):
+        bot = self.make_bot(auto_pick=True, pick_mode="instant")
+        self.client.routes[("GET", "/lol-champ-select/v1/pickable-champions")] = FakeResponse(200, [105])
+        state = self.route_pick(accept={105})                 # Ahri really not owned
+        started = time.monotonic()
+        self.assertTrue(bot._perform_action(7, "pick", ["Ahri", "Fizz"], 30_000, instant=True,
+                                            session=self.hovered_by_other()))
+        self.assertEqual(state["locked"], 105)
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_champion_locked_by_another_player_first_falls_to_next_priority(self):
+        bot = self.make_bot(auto_pick=True, pick_mode="instant")
+        self.client.routes[("GET", "/lol-champ-select/v1/pickable-champions")] = FakeResponse(200, [103, 105])
+        locks = []
+
+        def patch(body):
+            if body and body.get("completed") and body.get("championId") == 105:
+                locks.append(105)
+            return FakeResponse(204)
+
+        self.client.routes[("PATCH", "/lol-champ-select/v1/session/actions/7")] = patch
+        self.client.routes[("GET", "/lol-champ-select/v1/session")] = lambda _b: FakeResponse(200, {"actions": [[
+            {"id": 7, "championId": locks[0] if locks else 0, "completed": bool(locks), "isInProgress": True},
+            {"id": 8, "type": "pick", "championId": 103, "completed": True}]]})
+        self.assertTrue(bot._perform_action(7, "pick", ["Ahri", "Fizz"], 30_000, instant=True))
+        self.assertEqual(locks, [105])
+        self.assertTrue(any("locked by another player" in line for line in self.logs))
+
+    def test_list_fetched_during_a_hover_is_asked_again(self):
+        bot = self.make_bot(auto_pick=True, pick_mode="instant")
+        answers = [[105], [103, 105]]
+        self.client.routes[("GET", "/lol-champ-select/v1/pickable-champions")] = \
+            lambda _b: FakeResponse(200, answers.pop(0))
+        self.assertEqual(bot._available_champions("pick", {103}), {105})
+        self.route_pick(accept={103, 105})
+        self.assertTrue(bot._perform_action(7, "pick", ["Ahri"], 30_000, instant=True, session=self.session()))
+        self.assertEqual(answers, [])
+
     def test_empty_pickable_list_does_not_block_the_pick(self):
         bot = self.make_bot(auto_pick=True, pick_mode="instant")
         self.client.routes[("GET", "/lol-champ-select/v1/pickable-champions")] = FakeResponse(200, [])

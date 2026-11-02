@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.06
+
+- Instant pick: a champion someone else is hovering is no longer skipped
+  as "not owned or disabled". The client leaves hovered champions out of
+  its pickable list, so the bot now still tries to lock them.
+- If that champion cannot be locked (really not owned, or another player
+  locks it first), the bot moves on to the next priority within a second
+  instead of retrying it for 8 seconds.
+
 ## 1.05
 
 - Instant pick/ban keeps resending the lock-in for up to 8 seconds until
