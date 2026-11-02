@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.07
+
+- Auto Pick: when a priority champion is skipped, the log now says why.
+  In Arena each champion can be taken once per lobby and the other teams'
+  picks are not visible in champ select, so an owned champion is reported
+  as "taken by another player in this lobby" instead of "not owned".
+
 ## 1.06
 
 - Instant pick: a champion someone else is hovering is no longer skipped

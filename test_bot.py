@@ -160,6 +160,18 @@ class ChampSelectFixTests(BotFixTestCase):
         self.assertEqual(locks, [105])
         self.assertTrue(any("locked by another player" in line for line in self.logs))
 
+    def test_skip_message_tells_taken_in_lobby_from_not_owned(self):
+        # Arena: another team took Ahri, so the client leaves it out; Fizz is not owned.
+        bot = self.make_bot(auto_pick=True, pick_mode="instant")
+        self.client.routes[("GET", "/lol-champ-select/v1/pickable-champions")] = FakeResponse(200, [1])
+        self.client.routes[("GET", "/lol-champions/v1/owned-champions-minimal")] = FakeResponse(200, [
+            {"id": 103, "ownership": {"owned": True}}, {"id": 105, "ownership": {"owned": False}}])
+        self.assertFalse(bot._perform_action(7, "pick", ["Ahri", "Fizz"], 30_000, instant=True,
+                                             session=self.session()))
+        self.assertTrue(any("Ahri cannot be picked (taken by another player in this lobby" in line
+                            for line in self.logs))
+        self.assertTrue(any("Fizz cannot be picked (not owned)" in line for line in self.logs))
+
     def test_list_fetched_during_a_hover_is_asked_again(self):
         bot = self.make_bot(auto_pick=True, pick_mode="instant")
         answers = [[105], [103, 105]]

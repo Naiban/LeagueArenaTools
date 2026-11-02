@@ -1225,6 +1225,27 @@ class LeagueArenaToolsBot:
         # An empty list (asked too early) is not cached: ask again next time.
         return available
 
+    def _unavailable_reason(self, kind, champion_id):
+        """Why the client leaves a champion out of the pickable list. Arena
+        allows each champion once per lobby, and the other teams' picks are
+        not in our champ select session, so an owned champion missing from
+        the list is most often taken by another team."""
+        if kind == "ban":
+            return "already banned or disabled"
+        try:
+            r = self.client.get("/lol-champions/v1/owned-champions-minimal")
+            champions = r.json() if r.status_code == 200 else None
+        except Exception:
+            champions = None
+        if isinstance(champions, list):
+            for champion in champions:
+                if champion.get("id") == champion_id:
+                    if (champion.get("ownership") or {}).get("owned") or champion.get("freeToPlay"):
+                        return "taken by another player in this lobby, or disabled"
+                    break
+            return "not owned"
+        return "not owned, disabled or taken by another player in this lobby"
+
     def _mark_kind_done(self, kind):
         status = dict(self._cs_kind_status)
         status[kind] = "done"
@@ -1448,7 +1469,7 @@ class LeagueArenaToolsBot:
                     # Hovered when the list was fetched, not any more: ask again.
                     available = self._available_champions(kind, hovered, refresh=True)
                 if available is not None and entry not in available and entry not in hovered:
-                    self._log_once(f"{label} cannot be {verb} (not owned or disabled) - "
+                    self._log_once(f"{label} cannot be {verb} ({self._unavailable_reason(kind, entry)}) - "
                                    f"checking next {kind} priority.")
                     continue
                 may_be_unpickable = available is not None and entry not in available
